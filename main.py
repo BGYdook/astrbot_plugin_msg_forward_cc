@@ -890,9 +890,16 @@ class MsgForward(star.Star):
         # 冷却失效提示：队列模式下冷却被跳过，按 rule_key 只告警一次（避免刷屏日志）
         self._cooldown_warned: set = set()
 
-        # 发送队列：FIFO 队列，队列间隔 > 0 时消息不立即转发，而是由后台 worker
-        # 每隔设定秒数依次发送一条（与「冷却」的丢弃语义互补）
-        self._send_queue: asyncio.Queue = asyncio.Queue()
+        # 发送队列：按规则（rule_key）分桶的 FIFO 队列，队列间隔 > 0 时消息
+        # 不立即转发，而是由后台 worker 按每规则独立间隔依次发送（与「冷却」的
+        # 丢弃语义互补）。各规则桶互不阻塞——某规则间隔长不会拖慢其他规则的节拍。
+        self._rule_queues: dict[str, asyncio.Queue] = {}
+        # 每规则下一次允许发送的单调时钟时间戳（无记录=立即可发）；
+        # worker 发送后置为「发送时刻 + 该条间隔」，实现规则级独立限流
+        self._rule_next_send: dict[str, float] = {}
+        # 唤醒 worker 的事件：新条目入队 / 磁盘恢复入队时 set，
+        # 避免 worker 睡在等待中错过到点的条目
+        self._queue_wake: asyncio.Event = asyncio.Event()
         # 队列积压按规则归集计数：rule_key → 当前积压条数（入队 +1，worker 取走 -1）
         self._queue_rule_counts: dict[str, int] = {}
         self._queue_worker_task: asyncio.Task | None = None
@@ -1744,7 +1751,7 @@ class MsgForward(star.Star):
         retention = int(self.config.get("queue_media_retention_hours", 0) or 0)
         if retention <= 0:
             retention = 24
-        pending = self._send_queue.qsize()
+        pending = self._queue_total_size()
 
         lines = [
             "📋 发送队列状态：",
@@ -1952,15 +1959,20 @@ class MsgForward(star.Star):
     @queue.command("clear")
     async def cmd_queue_clear(self, event: AstrMessageEvent):
         """清空当前积压的发送队列，并清理队列媒体缓存"""
-        n = self._send_queue.qsize()
-        while not self._send_queue.empty():
-            try:
-                self._send_queue.get_nowait()
-                self._send_queue.task_done()
-            except asyncio.QueueEmpty:
-                break
-        # 队列已空，按规则归集的积压计数一并清零
+        n = self._queue_total_size()
+        for q in self._rule_queues.values():
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        self._rule_queues.clear()
+        # 队列已空，按规则归集的积压计数与下次发送记录一并清零
         self._queue_rule_counts = {}
+        self._rule_next_send.clear()
+        # 唤醒 worker 及时重算（它可能正睡在某规则的等待时刻上）
+        self._queue_wake.set()
         # 同步清空磁盘持久化队列
         try:
             self._save_persisted_queue([])
@@ -1980,7 +1992,7 @@ class MsgForward(star.Star):
             yield event.plain_result("⏸️ 发送队列已处于暂停状态")
             return
         self._queue_paused = True
-        yield event.plain_result(f"⏸️ 发送队列已暂停（当前积压 {self._send_queue.qsize()} 条暂不发送）")
+        yield event.plain_result(f"⏸️ 发送队列已暂停（当前积压 {self._queue_total_size()} 条暂不发送）")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @queue.command("resume")
@@ -1990,7 +2002,9 @@ class MsgForward(star.Star):
             yield event.plain_result("▶️ 发送队列未处于暂停状态")
             return
         self._queue_paused = False
-        yield event.plain_result(f"▶️ 发送队列已恢复（继续发送积压的 {self._send_queue.qsize()} 条消息）")
+        # 唤醒 worker：它可能正睡在等待条目的唤醒事件上（见 _queue_worker）
+        self._queue_wake.set()
+        yield event.plain_result(f"▶️ 发送队列已恢复（继续发送积压的 {self._queue_total_size()} 条消息）")
 
     def _clear_media_cache(self) -> int | None:
         """清空队列媒体缓存目录（AstrBot data 目录下 media/）下的所有文件。
@@ -2415,6 +2429,18 @@ class MsgForward(star.Star):
         except (TypeError, ValueError):
             return 0
 
+    def _queue_total_size(self) -> int:
+        """统计全部规则队列的积压条数总和（各规则桶 qsize 之和）。"""
+        return sum(q.qsize() for q in self._rule_queues.values())
+
+    def _rule_queue(self, rule_key: str) -> asyncio.Queue:
+        """按 rule_key 取对应规则桶队列，不存在时懒创建（空规则 key 归入共用桶）。"""
+        q = self._rule_queues.get(rule_key)
+        if q is None:
+            q = asyncio.Queue()
+            self._rule_queues[rule_key] = q
+        return q
+
     def _queued_count_for_rule(self, rule_key: str) -> int:
         """统计队列中属于某条规则的积压条数（按入队时记录的 rule_key 归集）。
 
@@ -2479,7 +2505,7 @@ class MsgForward(star.Star):
           2. 规则级 queue_max_size —— 本规则在队列中的独立积压上限（按 rule_key 归集）。
         入队后同步持久化到磁盘（queue.json），重启/重载后由 initialize 恢复。"""
         global_max = self._queue_global_max()
-        if global_max > 0 and self._send_queue.qsize() >= global_max:
+        if global_max > 0 and self._queue_total_size() >= global_max:
             logger.error(
                 f"❌ 发送队列已满（总上限 {global_max} 条），本条消息被丢弃 → {target}。"
                 f"请调大 queue_max_size 或降低发送频率。"
@@ -2508,7 +2534,10 @@ class MsgForward(star.Star):
             "proxy_url": proxy_url,
             "rule_key": rule_key,
         }
-        self._send_queue.put_nowait(item)
+        # 按规则分桶入队（不同规则的桶互不阻塞，各自按自己的间隔调度）
+        self._rule_queue(rule_key).put_nowait(item)
+        # 唤醒 worker：可能有规则桶已到可发送时刻（或初始立即可发）
+        self._queue_wake.set()
         if rule_key:
             self._queue_rule_counts[rule_key] = self._queue_rule_counts.get(rule_key, 0) + 1
         # 持久化：入队即写盘（序列化链组件），发送成功后由 worker 按 uid 移除
@@ -2581,7 +2610,8 @@ class MsgForward(star.Star):
                 # sanitized_chain 不含来源头；result 才前置来源头（与入队时一致）
                 result_chain = ([Plain(text=header_text)] + chain) if header_text else chain
                 result = MessageEventResult(chain=result_chain)
-                self._send_queue.put_nowait({
+                rk = it.get("rule_key", "") or ""
+                self._rule_queue(rk).put_nowait({
                     "uid": it.get("uid", ""),
                     "target": it.get("target", ""),
                     "result": result,
@@ -2591,9 +2621,8 @@ class MsgForward(star.Star):
                     "has_media": bool(it.get("has_media", False)),
                     "use_proxy": bool(it.get("use_proxy", False)),
                     "proxy_url": it.get("proxy_url", None),
-                    "rule_key": it.get("rule_key", "") or "",
+                    "rule_key": rk,
                 })
-                rk = it.get("rule_key", "") or ""
                 if rk:
                     self._queue_rule_counts[rk] = self._queue_rule_counts.get(rk, 0) + 1
                 restored += 1
@@ -2603,7 +2632,12 @@ class MsgForward(star.Star):
             logger.info(f"✅ 已从磁盘恢复 {restored} 条未发送完的队列消息")
 
     async def _queue_worker(self):
-        """后台发送队列消费者：逐条发送，每发一条后按该条间隔休眠再发下一条。
+        """后台发送队列消费者：按规则（rule_key）分桶独立调度。
+
+        每条规则一个 FIFO 桶，各自维护「下一次可发送时刻」（_rule_next_send），
+        到点才发送该桶的下一条——不同规则的间隔互不拖累：60s 的规则不会因
+        300s 的规则刚发过一条而被迫多等（旧版单一全局队列 + 统一 sleep 的
+        头阻塞问题，见 __init__ 中 _rule_queues 注释）。
 
         单条消息发送失败（含异常）只记录日志、不影响后续消息；整体用外层兜底，
         确保 worker 永不因单条消息或意外异常而退出，避免队列永久卡住。"""
@@ -2612,17 +2646,46 @@ class MsgForward(star.Star):
                 # 暂停时阻塞等待，直到 resume 唤醒；不消费队列中的消息
                 while self._queue_paused:
                     await asyncio.sleep(0.5)
-                item = await self._send_queue.get()
-                self._dec_queue_count(item.get("rule_key", ""))
-                try:
-                    await self._send_queued_item(item)
-                except Exception as e:
-                    logger.error(f"❌ 队列发送异常: {e}")
-                finally:
-                    self._send_queue.task_done()
-                interval = item.get("interval", 0)
-                if interval > 0:
-                    await asyncio.sleep(interval)
+                now = time.monotonic()
+                # 找一条「已到可发送时刻且有积压」的规则桶（FIFO 依次发送）
+                ready_key = None
+                for rule_key, q in self._rule_queues.items():
+                    if not q.empty() and self._rule_next_send.get(rule_key, 0.0) <= now:
+                        ready_key = rule_key
+                        break
+                if ready_key is not None:
+                    q = self._rule_queues[ready_key]
+                    item = q.get_nowait()
+                    self._dec_queue_count(item.get("rule_key", ""))
+                    try:
+                        await self._send_queued_item(item)
+                    except Exception as e:
+                        logger.error(f"❌ 队列发送异常: {e}")
+                    finally:
+                        q.task_done()
+                    # 间隔从发送完成起算（保持旧版语义：发完一条隔 N 秒再发下一条）
+                    self._rule_next_send[ready_key] = \
+                        time.monotonic() + item.get("interval", 0)
+                    # 发送完立即回到循环顶部：其他规则桶可能已到点
+                    continue
+                # 没有桶到点：睡到最近的到期时刻；期间新条目入队会唤醒提前重算
+                next_at = None
+                for rule_key, q in self._rule_queues.items():
+                    if q.empty():
+                        continue
+                    nxt = self._rule_next_send.get(rule_key, 0.0)
+                    if next_at is None or nxt < next_at:
+                        next_at = nxt
+                self._queue_wake.clear()
+                if next_at is None:
+                    # 全部规则桶为空：挂起等待新条目入队
+                    await self._queue_wake.wait()
+                else:
+                    wait = max(0.0, next_at - time.monotonic())
+                    try:
+                        await asyncio.wait_for(self._queue_wake.wait(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        pass
             except asyncio.CancelledError:
                 # 插件终止（terminate 调用 task.cancel()）时正常退出，其余情况不让 worker 挂掉
                 raise
