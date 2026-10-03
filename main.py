@@ -932,6 +932,9 @@ class MsgForward(star.Star):
         self._discord_hook_task: asyncio.Task | None = None
         self._discord_hook_logged: bool = False
         self._discord_hook_warned: bool = False
+        self._discord_hook_attempts: int = 0
+        self._discord_hook_ready_warned: bool = False
+        self._discord_empty_skipped: int = 0
         self._discord_handled_ids: set = set()
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
@@ -2853,6 +2856,21 @@ class MsgForward(star.Star):
                 logger.warning(f"[astrbot_plugin_msg_forward_cc] ⚠️ Discord 机器人消息接管异常：{e}")
             await asyncio.sleep(_DISCORD_HOOK_INTERVAL)
 
+    @staticmethod
+    def _discord_client_of(platform: object) -> object | None:
+        """取 Discord 适配器持有的 py-cord 客户端。
+
+        核心各版本的属性名不一定叫 `client`，因此先按属性名取，取不到再按能力探测
+        （带 add_listener 且有 user 的对象即为客户端），避免版本差异导致静默不挂载。
+        """
+        client = getattr(platform, "client", None)
+        if client is not None and hasattr(client, "add_listener"):
+            return client
+        for value in vars(platform).values():
+            if hasattr(value, "add_listener") and hasattr(value, "user"):
+                return value
+        return None
+
     def _hook_discord_clients(self) -> None:
         """为所有已就绪的 Discord 客户端补挂机器人消息监听（幂等）。"""
         try:
@@ -2866,11 +2884,15 @@ class MsgForward(star.Star):
             return
 
         hooked = 0
+        found = 0
+        pending = ""
         for platform in self.context.platform_manager.get_insts():
             if not MsgForward._is_discord_platform(platform):
                 continue
-            client = getattr(platform, "client", None)
+            found += 1
+            client = MsgForward._discord_client_of(platform)
             if client is None:
+                pending = f"{type(platform).__name__} 尚未持有可用客户端"
                 continue
             hook = getattr(client, _DISCORD_HOOK_ATTR, None)
             if hook is not None:
@@ -2886,6 +2908,7 @@ class MsgForward(star.Star):
                 client.add_listener(listener, "on_message")
                 setattr(client, _DISCORD_HOOK_ATTR, (self, listener))
             except Exception as e:
+                pending = f"挂载 {type(client).__name__} 失败：{e}"
                 logger.warning(f"[astrbot_plugin_msg_forward_cc] ⚠️ 挂载 Discord 机器人消息监听失败：{e}")
                 try:
                     client.remove_listener(listener)
@@ -2900,12 +2923,21 @@ class MsgForward(star.Star):
                 f"[astrbot_plugin_msg_forward_cc] ✅ 已接管 {hooked} 个 Discord 适配器的机器人/Webhook 消息转发"
             )
 
+        if found and not hooked:
+            # 有 Discord 适配器却没挂上（客户端还没就绪 / 结构不符）：约 1 分钟后告警一次，避免静默失效
+            self._discord_hook_attempts += 1
+            if self._discord_hook_attempts >= 4 and not self._discord_hook_ready_warned:
+                self._discord_hook_ready_warned = True
+                logger.warning(
+                    f"[astrbot_plugin_msg_forward_cc] ⚠️ 发现 {found} 个 Discord 适配器，但机器人消息监听尚未挂载：{pending}"
+                )
+
     def _unhook_discord_clients(self) -> None:
         """摘除本实例挂载的 Discord 机器人消息监听（插件重载/卸载时调用）。"""
         for platform in self.context.platform_manager.get_insts():
             if not MsgForward._is_discord_platform(platform):
                 continue
-            client = getattr(platform, "client", None)
+            client = MsgForward._discord_client_of(platform)
             if client is None:
                 continue
             hook = getattr(client, _DISCORD_HOOK_ATTR, None)
@@ -2951,15 +2983,16 @@ class MsgForward(star.Star):
                     # 兼容核心把消息转换改为异步的版本
                     abm = await abm
                 if not abm.message:
-                    return  # 无正文也无附件（系统提示、纯卡片等）的消息跳过
+                    # 无正文也无附件（系统提示、纯 Embed 卡片等）跳过；前几条记日志便于排查
+                    if self._discord_empty_skipped < 5:
+                        self._discord_empty_skipped += 1
+                        logger.info(
+                            "[astrbot_plugin_msg_forward_cc] ℹ️ 跳过一条无正文/附件的 Discord 机器人消息"
+                            f"（频道 {getattr(abm, 'session_id', '')}，Discord 卡片 Embed 暂不转换）"
+                        )
+                    return
                 if not abm.self_id and bot_user is not None:
                     abm.self_id = str(bot_user.id)
-                message_id = str(getattr(abm, "message_id", "") or "")
-                if message_id:
-                    # 去重标记：核心若不再丢弃机器人消息，管道会再投递一次同一消息
-                    if len(self._discord_handled_ids) >= _DISCORD_HANDLED_IDS_MAX:
-                        self._discord_handled_ids.clear()
-                    self._discord_handled_ids.add(message_id)
                 event = event_cls(
                     message_str=abm.message_str,
                     message_obj=abm,
@@ -2968,6 +3001,13 @@ class MsgForward(star.Star):
                     client=client,
                 )
                 await self.forward_message(event)
+                # 去重标记必须放在转发之后：forward_message 开头会按消息 ID 跳过已接管的消息，
+                # 提前登记会让这次转发把自己拦掉
+                message_id = str(getattr(abm, "message_id", "") or "")
+                if message_id:
+                    if len(self._discord_handled_ids) >= _DISCORD_HANDLED_IDS_MAX:
+                        self._discord_handled_ids.clear()
+                    self._discord_handled_ids.add(message_id)
             except Exception as e:
                 logger.error(f"[astrbot_plugin_msg_forward_cc] ❌ Discord 机器人消息转发异常：{e}")
 
@@ -2978,7 +3018,9 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            # 监听投递，按消息 ID 去重，避免同一消息被转发两次
+            # 机器人消息若同时被核心管道（核心某天不再丢弃机器人消息时）与本插件补挂的
+            # 监听投递，按消息 ID 去重，避免同一消息被转发两次；监听侧在转发「之后」才登记 ID，
+            # 所以这里不会拦掉监听自己那次转发
             if (
                 self._discord_handled_ids
                 and event.get_platform_name() == "discord"
