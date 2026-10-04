@@ -175,6 +175,7 @@
 
 | 配置项 | key | 类型/默认 | 说明 |
 |------|------|------|------|
+| 接管 Discord 机器人/Webhook 消息 | `discord_takeover` | bool, true | 默认补挂监听接管（Discord 适配器丢弃 `author.bot` 消息）；**关掉后绝不改写客户端对象**，停用/卸载即彻底消失，代价是机器人/Webhook 消息不转发 |
 | 默认隐藏来源信息头 | `default_hide_header` | bool, false | 新建规则默认隐藏来源头 |
 | 来源信息头模板 | `header_template` | text | 变量 `{sender_name}{sender_id}{platform}{msg_type}{conversation_id}`，留空用默认格式 |
 | 消息过滤模式 | `filter_mode` | string, off | off / blacklist / whitelist |

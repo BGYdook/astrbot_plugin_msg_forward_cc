@@ -258,6 +258,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | 配置项 | 类型 | 默认值 | 说明 |
 | ------- | ------ | -------- | ------ |
 | `rules` | template_list | `[]` | 转发规则列表，可在 WebUI 直接增删改 |
+| `discord_takeover` | bool | `true` | 接管 Discord 机器人/Webhook 消息。Discord 适配器会丢弃机器人消息，故默认补挂监听接管；**关掉后插件不再改动客户端任何对象，停用/卸载即彻底消失**，代价是机器人/Webhook 消息不会被转发 |
 | `default_hide_header` | bool | `false` | 新建规则时默认是否隐藏来源信息头 |
 | `platform_names` | list | `["aiocqhttp=QQ"]` | 平台显示名映射，每项格式：`原始平台名=显示名`，未命中的平台自动使用内置名称 |
 | `header_template` | text | 见下方 | 来源信息头模板，支持变量替换 |

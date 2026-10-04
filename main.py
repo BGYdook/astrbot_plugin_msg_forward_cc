@@ -1321,8 +1321,16 @@ class MsgForward(star.Star):
         self._cleanup_old_media()
         # 启动定期清理任务
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        # Discord 机器人消息接管
-        self._discord_hook_task = asyncio.create_task(self._discord_hook_loop())
+        # Discord 机器人消息接管（可用 discord_takeover 关掉：关掉后本插件不再改写客户端对象，
+        # 卸载/停用即彻底消失，代价是 Discord 适配器丢弃的机器人/Webhook 消息收不到）
+        if self.config.get("discord_takeover", True):
+            self._discord_hook_task = asyncio.create_task(self._discord_hook_loop())
+        else:
+            logger.info(
+                "[astrbot_plugin_msg_forward_cc] ℹ️ 已关闭 Discord 机器人消息接管（discord_takeover=false），"
+                "插件不再改写客户端，机器人/Webhook 消息不会被转发"
+            )
+            self._unhook_discord_clients()
         # 重复规则提示：同源同目标的两条规则会让「关掉一条仍在转发」看起来像失效
         try:
             for idxs, src, dst in self._duplicate_rule_groups():
@@ -3451,6 +3459,8 @@ class MsgForward(star.Star):
 
         只有当前活跃实例才挂载：插件重载后旧实例的任务可能尚未结束，若不拦住，
         新旧实例会来回抢挂监听，旧实例还会按旧配置继续转发。"""
+        if not self.config.get("discord_takeover", True):
+            return  # 接管开关关闭：绝不改写客户端对象
         active = _active_of(self.context)
         if active is not None and active is not self:
             return

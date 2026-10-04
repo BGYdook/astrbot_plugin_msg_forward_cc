@@ -1,4 +1,10 @@
 {
+  "discord_takeover": {
+    "description": "接管 Discord 机器人/Webhook 消息",
+    "type": "bool",
+    "hint": "Discord 适配器会直接丢弃机器人（含 Webhook）消息，导致公告类消息无法转发，因此默认由本插件给客户端补挂监听来接管。关闭后插件不再改动客户端任何对象，停用/卸载即彻底消失，但机器人/Webhook 消息不会被转发。",
+    "default": true
+  },
   "default_hide_header": {
     "description": "新建转发规则时，默认是否隐藏来源信息头。",
     "type": "bool",
