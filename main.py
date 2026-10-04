@@ -855,9 +855,23 @@ _DISCORD_HANDLED_IDS_MAX = 500
 
 _DISCORD_HOOK_EVENT_ATTR = "_mf_from_discord_hook"
 
-# 当前活跃的插件实例：补挂监听一律通过它转发，避免 WebUI 保存配置触发插件重载后，
-# 仍挂在客户端上的旧实例（旧配置）继续按旧规则转发
-_ACTIVE_INSTANCE: object | None = None
+# 当前活跃插件实例的标记名。挂在 AstrBot 的 Context 上而不是模块全局变量：
+# 插件重载会清空 sys.modules 并重新导入本模块，模块全局变量不跨代共享（旧监听读到的
+# 仍是旧实例），而 Context 全进程唯一、每代实例都拿到同一个对象
+_ACTIVE_ATTR = "_mf_active_instance"
+
+
+def _mark_active(context: object, instance: object) -> None:
+    """登记当前活跃实例（Context 不支持写属性时静默降级，不影响转发）。"""
+    try:
+        setattr(context, _ACTIVE_ATTR, instance)
+    except Exception:
+        pass
+
+
+def _active_of(context: object) -> object | None:
+    """取当前活跃实例；未登记返回 None。"""
+    return getattr(context, _ACTIVE_ATTR, None)
 
 
 # ------------------------
@@ -1262,8 +1276,7 @@ class MsgForward(star.Star):
 
     async def initialize(self):
         # 登记为当前活跃实例：补挂监听与转发都以此实例的配置为准
-        global _ACTIVE_INSTANCE
-        _ACTIVE_INSTANCE = self
+        _mark_active(self.context, self)
         # 恢复上次未发送完的持久化队列（重启/重载不丢消息）
         self._restore_persisted_queue()
         self._queue_worker_task = asyncio.create_task(self._queue_worker())
@@ -3378,7 +3391,8 @@ class MsgForward(star.Star):
 
         只有当前活跃实例才挂载：插件重载后旧实例的任务可能尚未结束，若不拦住，
         新旧实例会来回抢挂监听，旧实例还会按旧配置继续转发。"""
-        if _ACTIVE_INSTANCE is not None and _ACTIVE_INSTANCE is not self:
+        active = _active_of(self.context)
+        if active is not None and active is not self:
             return
         try:
             from astrbot.core.platform.sources.discord.discord_platform_event import (
@@ -3407,7 +3421,7 @@ class MsgForward(star.Star):
                     hooked += 1
                     continue
                 # 活跃实例持有的监听不要抢（否则新旧实例来回抢挂）
-                if hook[0] is _ACTIVE_INSTANCE:
+                if hook[0] is active:
                     continue
                 try:
                     client.remove_listener(hook[1])
@@ -3478,9 +3492,11 @@ class MsgForward(star.Star):
 
         async def _on_discord_bot_message(message: "discord.Message") -> None:
             try:
-                # 始终用当前活跃实例转发：WebUI 保存配置会重载插件，旧实例带着旧配置，
-                # 若还挂在客户端上就会「关掉规则仍照转」；活跃实例未登记时退回自身
-                plugin = _ACTIVE_INSTANCE or self
+                # 始终用当前活跃实例转发：WebUI 保存配置会重载插件（清 sys.modules 重新导入），
+                # 旧实例带着旧配置留在客户端上就会「关掉规则仍照转」。优先取 Context 上的活跃
+                # 实例，其次取客户端上最后挂载的监听所属实例，都没有才退回自身
+                info = getattr(client, _DISCORD_HOOK_ATTR, None)
+                plugin = _active_of(self.context) or (info[0] if info else None) or self
                 author = getattr(message, "author", None)
                 if author is None or not getattr(author, "bot", False):
                     return
@@ -3547,6 +3563,13 @@ class MsgForward(star.Star):
                      if source_umo in MsgForward._umo_list(r, "source_umo")]
             if not rules:
                 return
+            # 一条消息命中多条规则时会分别转发（每个规则 × 每个目标各一条），命中数记一行日志，
+            # 便于区分「插件重复发送」和「本来就有多条规则/多个目标」
+            if len(rules) > 1:
+                logger.info(
+                    f"[astrbot_plugin_msg_forward_cc] 📋 消息 {message_id or '-'}（{source_umo}）同时命中 "
+                    f"{len(rules)} 条规则：{'、'.join('#' + str(rid) for rid, _ in rules)}，将分别转发"
+                )
 
             raw_chain = event.get_messages()
             # 清洗无效的 @ 提及（空目标）
@@ -3558,8 +3581,9 @@ class MsgForward(star.Star):
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
-            # 本次事件已发出的「目标 → 内容签名」集合，用于拦截同内容重复发送
-            sent_chain_keys: dict[str, set] = {}
+            # 本次事件里「已实际发送过的目标 → 首次发送它的规则编号」：同一条源消息对同一目标
+            # 只允许发一次（多条规则命中同源同目标、或同一目标写了两遍，都只会造成刷屏）
+            sent_targets: dict[str, int] = {}
 
             for rid, rule in rules:
                 targets = MsgForward._umo_list(rule, "target_umo")
@@ -3582,7 +3606,8 @@ class MsgForward(star.Star):
                     continue
 
                 # 转发时翻译（规则级开关）：只翻文字组件，媒体与来源信息头都不动
-                if self._should_translate(rule):
+                translate_on = self._should_translate(rule)
+                if translate_on:
                     filtered_chain = await self._translate_chain(filtered_chain)
 
                 # 冷却检查
@@ -3636,23 +3661,27 @@ class MsgForward(star.Star):
                         base_chain = _textify_at_chain(message_chain)
                     new_chain = base_chain if not header_text else [Plain(text=header_text)] + base_chain
 
-                    # 同一事件内防重复：多条规则命中同一目标且最终内容完全一致时只发一次
-                    # （最常见的原因是重复建了两条相同规则），并告警提示检查
-                    chain_key = json.dumps(_serialize_chain(new_chain), ensure_ascii=False, sort_keys=True)
-                    if chain_key in sent_chain_keys.setdefault(target, set()):
+                    # 同一个目标对同一条源消息只发一次：命中多条规则时后面的规则直接跳过并告警，
+                    # 避免「一个群收到好几分原文/译文」（需要两种内容时请合并到同一条规则里）
+                    if target in sent_targets:
                         logger.warning(
-                            f"[astrbot_plugin_msg_forward_cc] ⚠️ 规则 #{rid}（{self._rule_name(rule)}）与本次已命中的"
-                            f"其他规则把同一条消息发往 {target}，内容完全相同，本次只发一次（请检查是否有重复规则）"
+                            f"[astrbot_plugin_msg_forward_cc] ⚠️ 规则 #{rid}（{self._rule_name(rule)}）与规则 "
+                            f"#{sent_targets[target]} 都把同一条消息发往 {target}，本次只由先命中的规则发一次"
                         )
                         continue
-                    sent_chain_keys[target].add(chain_key)
 
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
                     if queue_interval > 0:
                         # 队列模式下必须本地化媒体，防止源端临时文件延迟后被清理
-                        queue_chain = await _prepare_chain_for_queue(
-                            base_chain, use_proxy=use_proxy, proxy_url=proxy_url,
-                        )
+                        try:
+                            queue_chain = await _prepare_chain_for_queue(
+                                base_chain, use_proxy=use_proxy, proxy_url=proxy_url,
+                            )
+                        except Exception as e:
+                            # 单目标失败不中断其他规则/目标（与直接发送路径的降级语义一致）
+                            logger.error(f"❌ 规则 #{rid} 入队前媒体本地化失败，本目标跳过: {e}")
+                            continue
+                        sent_targets[target] = rid
                         self._enqueue_send(
                             target, event.chain_result(queue_chain), queue_interval,
                             base_chain, header_text, has_media,
@@ -3665,7 +3694,10 @@ class MsgForward(star.Star):
                         cd_end = self._cooldowns.get(cd_key, 0)
                         if now < cd_end:
                             continue
+                    # 冷却跳过时不算「已发送」：否则别的规则命中同一目标也会被拦下，消息直接丢失
+                    sent_targets[target] = rid
                     try:
+                        self._log_send(rid, target, message_id, len(new_chain), "｜🌐译文" if translate_on else "｜原文")
                         await self.context.send_message(target, event.chain_result(new_chain))
                         # 转发成功后设置冷却
                         if cooldown_sec > 0:
@@ -3673,38 +3705,44 @@ class MsgForward(star.Star):
                     except ValueError as e:
                         logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                     except Exception as e:
-                        # 第一层降级：AstrBot 核心重新本地化所有媒体
+                        # 只在链中含媒体时降级重试，且**只重试一次**：
+                        # 发送抛异常并不代表没发出去（协议端超时但已投递很常见），每多重试一次就多一份重复消息；
+                        # 纯文字链重发更没有收益，直接记录失败即可
+                        if not has_media:
+                            logger.error(f"❌ 转发失败（纯文字链不重试，避免重复发送）: {e}")
+                            continue
                         try:
                             if fallback_chain is None:
-                                prepared = await _prepare_chain_for_forward(filtered_chain)
-                                fallback_chain = prepared if not header_text else [Plain(text=header_text)] + prepared
+                                # 规则配了代理就用自带的远程 URL 本地化，否则用核心重新本地化
+                                if use_proxy:
+                                    localized = await _prepare_chain_fallback(
+                                        filtered_chain, use_proxy=True, proxy_url=proxy_url,
+                                    )
+                                else:
+                                    localized = await _prepare_chain_for_forward(filtered_chain)
+                                fallback_chain = localized if not header_text else [Plain(text=header_text)] + localized
+                            self._log_send(rid, target, message_id, len(fallback_chain), "｜媒体本地化重试")
                             await self.context.send_message(target, event.chain_result(fallback_chain))
-                            logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功")
+                            logger.warning(f"⚠️ 转发首次失败（{e}），已重新本地化媒体后重试成功（只重试一次）")
                             if cooldown_sec > 0:
                                 self._cooldowns[cd_key] = now + cooldown_sec
                         except Exception as e2:
-                            # 第二层降级：远程 URL 媒体
-                            if has_media:
-                                try:
-                                    localized = await _prepare_chain_fallback(filtered_chain, use_proxy=use_proxy, proxy_url=proxy_url)
-                                    fb_chain = localized if not header_text else [Plain(text=header_text)] + localized
-                                    await self.context.send_message(target, event.chain_result(fb_chain))
-                                    logger.warning(f"⚠️ 转发二次降级，已通过远程 URL 本地化后重试成功")
-                                    if cooldown_sec > 0:
-                                        self._cooldowns[cd_key] = now + cooldown_sec
-                                except Exception as e3:
-                                    logger.error(f"❌ 转发失败（本地化重试后仍失败）: {e3}")
-                            else:
-                                logger.error(f"❌ 转发失败: {e2}")
+                            logger.error(f"❌ 转发失败（媒体本地化重试后仍失败，不再重试）: {e2}")
 
         except Exception as e:
             logger.error(f"❌ 转发逻辑异常: {e}")
 
+    def _log_send(self, rid: int, target: str, message_id: str, segments: int, note: str = "") -> None:
+        """每次实际调用发送前记一行：排查「一条消息变成多条」时直接看这些行即可定位规则与目标。"""
+        logger.info(
+            f"[astrbot_plugin_msg_forward_cc] 📤 规则 #{rid} → {target} | 消息 {message_id or '-'} | "
+            f"{segments} 段{note}"
+        )
+
     async def terminate(self):
         # 注销活跃实例（仅当自己就是活跃实例时），避免重载后新实例被误清
-        global _ACTIVE_INSTANCE
-        if _ACTIVE_INSTANCE is self:
-            _ACTIVE_INSTANCE = None
+        if _active_of(self.context) is self:
+            _mark_active(self.context, None)
         if self._queue_worker_task is not None:
             self._queue_worker_task.cancel()
         if self._cleanup_task is not None:
