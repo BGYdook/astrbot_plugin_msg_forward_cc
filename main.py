@@ -852,6 +852,8 @@ _DISCORD_HOOK_INTERVAL = 15
 
 _DISCORD_HANDLED_IDS_MAX = 500
 
+_DISCORD_HOOK_EVENT_ATTR = "_mf_from_discord_hook"
+
 
 # ------------------------
 # 存储层（无锁简化）
@@ -2993,6 +2995,10 @@ class MsgForward(star.Star):
                     return
                 if not abm.self_id and bot_user is not None:
                     abm.self_id = str(bot_user.id)
+                # 核心管道若已投递并转发过这条（说明该版本不过滤机器人消息），这次就不再转发
+                message_id = str(getattr(abm, "message_id", "") or "")
+                if message_id and message_id in self._discord_handled_ids:
+                    return
                 event = event_cls(
                     message_str=abm.message_str,
                     message_obj=abm,
@@ -3000,14 +3006,9 @@ class MsgForward(star.Star):
                     session_id=abm.session_id,
                     client=client,
                 )
+                # 标记来源通道：forward_message 会登记消息 ID 去重，但不该拦掉这次自己的转发
+                setattr(event, _DISCORD_HOOK_EVENT_ATTR, True)
                 await self.forward_message(event)
-                # 去重标记必须放在转发之后：forward_message 开头会按消息 ID 跳过已接管的消息，
-                # 提前登记会让这次转发把自己拦掉
-                message_id = str(getattr(abm, "message_id", "") or "")
-                if message_id:
-                    if len(self._discord_handled_ids) >= _DISCORD_HANDLED_IDS_MAX:
-                        self._discord_handled_ids.clear()
-                    self._discord_handled_ids.add(message_id)
             except Exception as e:
                 logger.error(f"[astrbot_plugin_msg_forward_cc] ❌ Discord 机器人消息转发异常：{e}")
 
@@ -3018,15 +3019,18 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            # 机器人消息若同时被核心管道（核心某天不再丢弃机器人消息时）与本插件补挂的
-            # 监听投递，按消息 ID 去重，避免同一消息被转发两次；监听侧在转发「之后」才登记 ID，
-            # 所以这里不会拦掉监听自己那次转发
-            if (
-                self._discord_handled_ids
-                and event.get_platform_name() == "discord"
-                and str(getattr(event.message_obj, "message_id", "") or "") in self._discord_handled_ids
-            ):
-                return
+            # Discord 消息有两条投递通道：核心事件管道与本插件
+            # 补挂的客户端监听。两条通道都会调用本函数，因此按消息 ID 去重：谁先到谁登记，
+            # 后到的一方直接跳过；监听侧调用时会带上 _DISCORD_HOOK_EVENT_ATTR 标记，表示
+            # 「这次就是监听自己那一次」，不会被自己刚登记的 ID 拦掉。
+            # 检查与登记之间不能有 await，否则并发投递会同时通过检查导致重复转发。
+            message_id = str(getattr(event.message_obj, "message_id", "") or "")
+            if event.get_platform_name() == "discord" and message_id:
+                if message_id in self._discord_handled_ids and not getattr(event, _DISCORD_HOOK_EVENT_ATTR, False):
+                    return
+                if len(self._discord_handled_ids) >= _DISCORD_HANDLED_IDS_MAX:
+                    self._discord_handled_ids.clear()
+                self._discord_handled_ids.add(message_id)
             # 带上 1-based 规则编号（与 /mf list 显示的编号一致）
             rules = [(rid, r) for rid, r in enumerate(self.config.get("rules", []), start=1)
                      if source_umo in MsgForward._umo_list(r, "source_umo")]
@@ -3043,6 +3047,8 @@ class MsgForward(star.Star):
             # At 可透传的目标平台集合（内置 QQ 系 + 配置追加）
             at_passthrough = _at_passthrough_platforms(self.config)
             now = time.time()
+            # 本次事件已发出的「目标 → 内容签名」集合，用于拦截同内容重复发送
+            sent_chain_keys: dict[str, set] = {}
 
             for rid, rule in rules:
                 targets = MsgForward._umo_list(rule, "target_umo")
@@ -3114,6 +3120,17 @@ class MsgForward(star.Star):
                     else:
                         base_chain = _textify_at_chain(message_chain)
                     new_chain = base_chain if not header_text else [Plain(text=header_text)] + base_chain
+
+                    # 同一事件内防重复：多条规则命中同一目标且最终内容完全一致时只发一次
+                    # （最常见的原因是重复建了两条相同规则），并告警提示检查
+                    chain_key = json.dumps(_serialize_chain(new_chain), ensure_ascii=False, sort_keys=True)
+                    if chain_key in sent_chain_keys.setdefault(target, set()):
+                        logger.warning(
+                            f"[astrbot_plugin_msg_forward_cc] ⚠️ 规则 #{rid}（{self._rule_name(rule)}）与本次已命中的"
+                            f"其他规则把同一条消息发往 {target}，内容完全相同，本次只发一次（请检查是否有重复规则）"
+                        )
+                        continue
+                    sent_chain_keys[target].add(chain_key)
 
                     # 队列模式：入队前本地化媒体到自有目录，再交给后台 worker 按间隔依次转发
                     if queue_interval > 0:
