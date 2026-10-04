@@ -874,6 +874,41 @@ def _active_of(context: object) -> object | None:
     return getattr(context, _ACTIVE_ATTR, None)
 
 
+# 插件自身目录名：用于在核心 star 注册表里定位本插件（判断是否仍装载/启用）
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_PLUGIN_DIR_NAME = os.path.basename(_PLUGIN_DIR)
+
+
+def _plugin_alive(instance: object) -> bool:
+    """本插件是否仍可用：目录还在，且在核心 star 注册表里仍处于启用状态。
+
+    补挂的监听挂在 Discord 客户端上，不随插件实例销毁；而核心的 `_terminate_plugin` 存在多个
+    提前返回（例如 `activated=False`、`star_cls is None`）——WebUI 卸载/停用插件时不保证会调用
+    `terminate()`。因此监听必须自己判断存活，否则「插件已删/已停用」后仍会按内存里的旧配置继续转发。
+    取不到注册表时按存活处理，避免误杀正常运行的插件。"""
+    try:
+        if not os.path.isdir(_PLUGIN_DIR):
+            return False  # 插件目录已被删除（WebUI 卸载）
+    except OSError:
+        pass
+    try:
+        from astrbot.core.star.star import star_registry
+    except Exception:
+        return True
+    try:
+        metas = [
+            md for md in list(star_registry)
+            if getattr(md, "root_dir_name", None) == _PLUGIN_DIR_NAME
+        ]
+        total = len(list(star_registry))
+    except Exception:
+        return True
+    if not metas:
+        # 注册表非空却找不到本插件 → 已卸载；注册表为空（核心尚未装载完）→ 不误杀
+        return total == 0
+    return bool(getattr(metas[0], "activated", True))
+
+
 # ------------------------
 # 转发时翻译（百度翻译开放平台「通用文本翻译」）
 # ------------------------
@@ -1135,6 +1170,8 @@ class MsgForward(star.Star):
         self._discord_hook_ready_warned: bool = False
         self._discord_empty_skipped: int = 0
         self._discord_handled_ids: set = set()
+        # 自检判定插件已停用/卸载后置位：保证只摘一次监听、只打一次日志
+        self._self_disabled: bool = False
         # 翻译告警去重：按 key 只告警一次，避免接口报错时每条消息刷屏
         self._translate_warned: set = set()
 
@@ -3361,8 +3398,12 @@ class MsgForward(star.Star):
 
         适配器客户端（platform.client）要等平台 run() 才创建，插件加载时通常还不存在；
         平台重连/重载也会换新客户端，所以用轮询持续补齐，而不是只在 initialize 挂一次。
+        每轮先自检存活：插件被停用/卸载后核心不保证调用 terminate()，此时必须自己摘监听并退出。
         """
         while True:
+            if not _plugin_alive(self):
+                self._self_disable("插件已停用或卸载")
+                return
             try:
                 self._hook_discord_clients()
             except asyncio.CancelledError:
@@ -3370,6 +3411,25 @@ class MsgForward(star.Star):
             except Exception as e:
                 logger.warning(f"[astrbot_plugin_msg_forward_cc] ⚠️ Discord 机器人消息接管异常：{e}")
             await asyncio.sleep(_DISCORD_HOOK_INTERVAL)
+
+    def _self_disable(self, reason: str) -> None:
+        """自检判定插件已不可用：摘掉自己补挂的监听并停掉后台任务。
+
+        不依赖核心是否调用 terminate()（WebUI 卸载/停用可能跳过），保证监听不会带着旧配置继续转发。
+        """
+        if self._self_disabled:
+            return
+        self._self_disabled = True
+        logger.info(
+            f"[astrbot_plugin_msg_forward_cc] ℹ️ 检测到{reason}，已摘除 Discord 机器人消息监听并停止后台任务"
+        )
+        try:
+            self._unhook_discord_clients()
+        except Exception as e:
+            logger.warning(f"[astrbot_plugin_msg_forward_cc] ⚠️ 摘除 Discord 监听失败：{e}")
+        for task in (self._discord_hook_task, self._queue_worker_task, self._cleanup_task):
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
 
     @staticmethod
     def _discord_client_of(platform: object) -> object | None:
@@ -3497,6 +3557,10 @@ class MsgForward(star.Star):
                 # 实例，其次取客户端上最后挂载的监听所属实例，都没有才退回自身
                 info = getattr(client, _DISCORD_HOOK_ATTR, None)
                 plugin = _active_of(self.context) or (info[0] if info else None) or self
+                # 插件已被停用/卸载（核心不保证调用 terminate）：自己摘掉监听并停止转发
+                if not _plugin_alive(plugin):
+                    plugin._self_disable("插件已停用或卸载")
+                    return
                 author = getattr(message, "author", None)
                 if author is None or not getattr(author, "bot", False):
                     return
@@ -3522,7 +3586,8 @@ class MsgForward(star.Star):
                     return
                 if not abm.self_id and bot_user is not None:
                     abm.self_id = str(bot_user.id)
-                # 核心管道若已投递并转发过这条（说明该版本不过滤机器人消息），这次就不再转发
+                # 与 forward_message 里的认领配合：已认领过（核心管道先到，或另一个监听先到）就直接退出，
+                # 省掉构造事件的开销；真正的去重在 forward_message 里做，这里只是快速路径
                 message_id = str(getattr(abm, "message_id", "") or "")
                 if message_id and message_id in plugin._discord_handled_ids:
                     return
@@ -3533,7 +3598,7 @@ class MsgForward(star.Star):
                     session_id=abm.session_id,
                     client=client,
                 )
-                # 标记来源通道：forward_message 会登记消息 ID 去重，但不该拦掉这次自己的转发
+                # 标记事件来自补挂监听（仅用于日志/排查，去重不再依赖它）
                 setattr(event, _DISCORD_HOOK_EVENT_ATTR, True)
                 await plugin.forward_message(event)
             except Exception as e:
@@ -3546,14 +3611,13 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            # Discord 消息有两条投递通道：核心事件管道与本插件
-            # 补挂的客户端监听。两条通道都会调用本函数，因此按消息 ID 去重：谁先到谁登记，
-            # 后到的一方直接跳过；监听侧调用时会带上 _DISCORD_HOOK_EVENT_ATTR 标记，表示
-            # 「这次就是监听自己那一次」，不会被自己刚登记的 ID 拦掉。
+            # Discord 消息有多条投递通道：核心事件管道 + 本插件补挂的客户端监听（插件重载/更新后
+            # 若旧监听没摘干净，还可能同时挂着多个监听）。它们在同一个事件循环里并发调用本函数，
+            # 因此按消息 ID 做一次性认领：谁先到谁登记并转发，其余一律跳过。
             # 检查与登记之间不能有 await，否则并发投递会同时通过检查导致重复转发。
             message_id = str(getattr(event.message_obj, "message_id", "") or "")
             if event.get_platform_name() == "discord" and message_id:
-                if message_id in self._discord_handled_ids and not getattr(event, _DISCORD_HOOK_EVENT_ATTR, False):
+                if message_id in self._discord_handled_ids:
                     return
                 if len(self._discord_handled_ids) >= _DISCORD_HANDLED_IDS_MAX:
                     self._discord_handled_ids.clear()
@@ -3743,6 +3807,8 @@ class MsgForward(star.Star):
         # 注销活跃实例（仅当自己就是活跃实例时），避免重载后新实例被误清
         if _active_of(self.context) is self:
             _mark_active(self.context, None)
+        # 与自检路径共用：两者都只会真正执行一次
+        self._self_disabled = True
         if self._queue_worker_task is not None:
             self._queue_worker_task.cancel()
         if self._cleanup_task is not None:
