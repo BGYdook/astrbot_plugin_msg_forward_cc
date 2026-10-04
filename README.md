@@ -26,6 +26,7 @@
 - **发送队列**：全局默认与规则级队列间隔，匹配消息进入队列后每隔设定时间转发一条；不同规则的队列按各自间隔**独立调度**，一条规则的间隔长短不会拖慢其它规则的发送节拍；支持规则级队列长度上限，达上限后新消息丢弃。
 - **媒体转发（失败自动降级）**：发送失败时自动下载远程媒体到本地重试。
 - **平台消息收全（含DC机器人消息）**：各平台下发的机器人消息都会照常转发；仅 Discord 适配器会把这类消息拦在事件管道之外，插件已自动补齐，无需额外设置。
+- **转发时翻译（可选，规则级开关）**：开启后转发前把文字译为目标语言（百度翻译开放平台·通用文本翻译），典型用法是「Discord 英文频道 → QQ」；只翻文字，图片/语音/视频/文件与来源信息头原样转发，接口失败自动保留原文继续转发。
 
 ### 🚀 快速开始
 
@@ -182,7 +183,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `mf bindraw` | 直接创建转发绑定（例：/mf bindraw qq 654321 wx 123456） |
 | `mf del` | 删除一条转发规则 |
 | `mf list` | 列出与当前会话相关的所有转发规则（可用于获取当前群号） |
-| `mf listall` | 列出所有转发规则 |
+| `mf listall` | 列出所有转发规则（末尾会提示同源同目标的重复规则，避免「关掉一条仍在转发」） |
 | `mf hide` | 切换规则的来源信息显示状态 |
 | `mf toggle` | 启用/停用一条转发规则 |
 | `mf remark` | 设置规则备注名称（例：/mf remark 2 同步群，留空清除备注） |
@@ -202,6 +203,14 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `mf at <编号> inherit` | 重置某条规则的 @ 昵称反查为继承全局 |
 | `mf at cache <秒>` | 设置群成员列表缓存时长（0=每次重新拉取，默认 300） |
 | `mf at test <群号\|UMO>` | 测试目标群 @ 昵称反查（拉取成员列表并显示命中情况） |
+| `mf translate status` | 查看翻译配置（开关/APPID 是否已填/语言/间隔）与各规则开关 |
+| `mf translate on` / `mf translate off` | 全局开启/关闭转发时翻译 |
+| `mf translate to <语言>` | 设置目标语言（`zh`/`中文`/`en`/`jp`…） |
+| `mf translate from <语言>` | 设置源语言（`auto`=自动检测，默认） |
+| `mf translate interval <毫秒>` | 两次调用百度接口的最小间隔（标准版 QPS=1 建议 1100） |
+| `mf translate keep on\|off` | 译文后是否附上原文 |
+| `mf translate <编号> on\|off\|inherit` | 设置某条规则是否翻译 |
+| `mf translate test <文本>` | 实测翻译，用于验证 APPID/密钥是否可用 |
 | `mf queue status` | 查看发送队列状态与配置（含各规则间隔/长度上限/当前积压） |
 | `mf queue on` / `mf queue off` | 启用/停用发送队列总开关 |
 | `mf queue interval <秒>` | 设置全局默认发送队列间隔（0=关闭） |
@@ -262,6 +271,15 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `at_nickname_lookup_cache_ttl` | int | `300` | 高级 @ 的群成员列表缓存时长（秒），0=每次重新拉取 |
 | `at_passthrough_extra_platforms` | list | `[]` | 额外允许 `@` 按 qq 透传的目标平台（仅高级 @ 开启时生效，内置已含 QQ 系平台） |
 | `download_media_before_send` | bool | `false` | 发送前先将媒体下载到本地，跨设备转发找不到文件时开启，每条规则可单独覆盖 |
+| `translate_enabled` | bool | `false` | **转发时翻译（默认关闭）**：开启后转发前把文字译为目标语言，每条规则可单独覆盖（`translate`） |
+| `translate_appid` / `translate_key` | string | `""` | 百度翻译开放平台的 APPID 与密钥（需先开通「通用文本翻译」），只存在插件配置里 |
+| `translate_to_lang` | string | `zh` | 译文语言，可写中文别名：`zh`/`中文`、`cht`/`繁体`、`en`/`英语`、`jp`/`日语`… |
+| `translate_from_lang` | string | `auto` | 原文语言，`auto`=自动检测；语言固定时写明（如 `en`）更准更快 |
+| `translate_skip_same_lang` | bool | `true` | 已是目标语言（中文目标下汉字占比 ≥60%）时跳过，省接口调用次数 |
+| `translate_keep_original` | bool | `false` | 译文后附上原文（`译文 + —— 原文 —— + 原文`） |
+| `translate_interval_ms` | int | `1100` | 两次调用百度接口的最小间隔（毫秒）；标准版 QPS=1 保持 1100，高级版可调小 |
+| `translate_timeout` | int | `10` | 单次请求超时（秒），超时/报错时保留原文继续转发 |
+| `translate_use_proxy` / `translate_proxy_url` | bool / string | `false` / `""` | 翻译请求是否走代理（一般不用开；留空走系统代理，填写走该地址） |
 
 #### `rules` 每条规则包含
 
@@ -280,6 +298,7 @@ a:GroupMessage:11451419 -> a:GroupMessage:14191981
 | `download_media_before_send` | string | 是否在发送媒体前先下载到本地（inherit=继承全局），支持 inherit/true/false |
 | `content_types` | list | 本规则转发的内容类型（多选，WebUI 显示中文、存储值为英文键，直接填中文也有效），空=继承全局 `default_content_types` |
 | `at_nickname_lookup` | string | 高级 @（昵称反查）开关：`false`/`off`=At 一律转为文本 `@昵称`（默认），`true`/`on`=QQ 系目标透传真实 At 并按昵称反查精确 @，`inherit`=继承全局，支持 inherit/true/false |
+| `translate` | string | 本规则转发时是否翻译：`true`/`on`=翻译（典型用法：Discord → QQ 的规则开启），`false`/`off`=不翻译，`inherit`=继承全局 `translate_enabled`；支持 inherit/true/false |
 
 #### `platform_names` 格式说明
 

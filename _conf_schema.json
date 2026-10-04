@@ -114,6 +114,14 @@
             "type": "string",
             "hint": "仅 use_proxy 开启时生效。留空走 AstrBot 自带代理；填写则走该地址（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）。",
             "default": ""
+          },
+          "translate": {
+            "description": "转发时翻译",
+            "type": "string",
+            "hint": "仅对本规则生效。开启后本规则转发前把文字译为目标语言（百度翻译开放平台，语言与 APPID/密钥在全局配置里填），图片/文件等媒体与来源信息头不翻译。典型用法：Discord → QQ 的规则开启，其他规则不受影响。",
+            "default": "inherit",
+            "options": ["inherit", "true", "false"],
+            "labels": ["继承全局", "开启", "关闭"]
           }
         }
       }
@@ -201,6 +209,72 @@
     "type": "list",
     "hint": "仅在「高级 @（昵称反查）」开启时生效。默认已包含 QQ 系平台（aiocqhttp / qq_official 等），这些平台会把 At 按 qq 原样透传、由协议端精确解析。若你使用其他自建 QQ 适配器，可在此填写其平台名（每行一个，同 UMO 第一段），让 @ 也按 qq 透传而不是降级为文本。跨平台（微信/Telegram 等）不要填。",
     "default": []
+  },
+  "translate_enabled": {
+    "description": "转发时翻译（默认关闭）",
+    "type": "bool",
+    "hint": "开启后，转发前把消息里的文字译为「目标语言」（百度翻译开放平台·通用文本翻译），图片/语音/视频/文件等媒体与来源信息头原样转发。规则未单独设置时按此全局开关；使用前需在下面填写 APPID 与密钥。",
+    "default": false
+  },
+  "translate_appid": {
+    "description": "百度翻译 APPID",
+    "type": "string",
+    "hint": "百度翻译开放平台（fanyi-api.baidu.com）控制台「开发者信息」里的 APPID，需先开通「通用文本翻译」。",
+    "default": ""
+  },
+  "translate_key": {
+    "description": "百度翻译密钥",
+    "type": "string",
+    "hint": "与 APPID 配套的密钥，用于请求签名（sign = md5(appid+q+salt+密钥)）。只存在插件配置里，不会发到聊天中。",
+    "default": ""
+  },
+  "translate_to_lang": {
+    "description": "翻译目标语言",
+    "type": "string",
+    "hint": "译文语言代码，可写中文别名：zh（简体中文，默认）、cht（繁体）、en（英语）、jp（日语）、kor（韩语）、fra、de、ru 等，完整代码见百度文档。",
+    "default": "zh"
+  },
+  "translate_from_lang": {
+    "description": "翻译源语言",
+    "type": "string",
+    "hint": "原文语言代码，默认 auto（自动检测）。内容语言固定时写明（如 en）可略微提速并提高准确率。",
+    "default": "auto"
+  },
+  "translate_skip_same_lang": {
+    "description": "已是目标语言则跳过翻译",
+    "type": "bool",
+    "hint": "默认开启：文字中汉字占比 ≥60% 且目标语言为中文时直接跳过，不消耗接口调用次数。关闭则一律调用接口。",
+    "default": true
+  },
+  "translate_keep_original": {
+    "description": "译文后附上原文",
+    "type": "bool",
+    "hint": "开启后转发内容为「译文 + —— 原文 —— + 原文」，便于对照；默认关闭只发译文。",
+    "default": false
+  },
+  "translate_interval_ms": {
+    "description": "翻译接口调用间隔（毫秒）",
+    "type": "int",
+    "hint": "两次调用百度接口的最小间隔，用于避免「访问频率受限（54003）」。标准版 QPS=1 → 保持 1100；高级版（QPS=10）可调小到 150 左右。",
+    "default": 1100
+  },
+  "translate_timeout": {
+    "description": "翻译接口超时（秒）",
+    "type": "int",
+    "hint": "单次请求超时时间。超时或报错时本条消息保留原文继续转发，不影响转发本身。",
+    "default": 10
+  },
+  "translate_use_proxy": {
+    "description": "翻译请求走代理",
+    "type": "bool",
+    "hint": "一般不用开（服务器在国内直连百度即可）。开启后 proxy_url 留空走系统代理（环境变量），填写则走该代理地址。",
+    "default": false
+  },
+  "translate_proxy_url": {
+    "description": "翻译代理地址",
+    "type": "string",
+    "hint": "仅「翻译请求走代理」开启时生效。留空走系统代理；填写则走该地址（如 http://127.0.0.1:7890）。",
+    "default": ""
   },
   "platform_names": {
     "description": "平台名称映射",

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -854,6 +855,188 @@ _DISCORD_HANDLED_IDS_MAX = 500
 
 _DISCORD_HOOK_EVENT_ATTR = "_mf_from_discord_hook"
 
+# 当前活跃的插件实例：补挂监听一律通过它转发，避免 WebUI 保存配置触发插件重载后，
+# 仍挂在客户端上的旧实例（旧配置）继续按旧规则转发
+_ACTIVE_INSTANCE: object | None = None
+
+
+# ------------------------
+# 转发时翻译（百度翻译开放平台「通用文本翻译」）
+# ------------------------
+
+_BAIDU_TRANSLATE_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+
+# 单次请求 q 的字节上限（官方 6000 字节），保守取 5000 后按 UTF-8 字节切分
+_BAIDU_Q_MAX_BYTES = 5000
+
+# 翻译前需要原样保留的片段：链接、Discord 标记（<:表情:id> / <@id> / <#频道>）、行内代码
+# 百度会改写这些符号，先用占位符换出、译完再还原
+_TRANSLATE_KEEP_RE = re.compile(r"(https?://\S+|<a?[:#@][^>\s]*>|`[^`\n]+`)")
+_TRANSLATE_PLACEHOLDER_RE = re.compile(r"\{+\s*(\d+)\s*\}+")
+
+# 百度标准版 QPS=1：串行调用并按最小间隔节流，避免 54003 频率受限
+_TRANSLATE_LOCK = asyncio.Lock()
+_TRANSLATE_LAST_CALL = 0.0
+
+# 语言别名 → 百度语言代码（配置与命令里写中文即可）
+_LANG_ALIASES = {
+    "自动": "auto", "自动检测": "auto", "auto": "auto",
+    "中文": "zh", "简体": "zh", "简体中文": "zh", "zh": "zh", "zh-cn": "zh", "zh_hans": "zh",
+    "繁体": "cht", "繁体中文": "cht", "cht": "cht", "zh-tw": "cht",
+    "英文": "en", "英语": "en", "en": "en",
+    "日文": "jp", "日语": "jp", "jp": "jp", "ja": "jp",
+    "韩文": "kor", "韩语": "kor", "kor": "kor", "ko": "kor",
+    "法文": "fra", "法语": "fra", "fra": "fra", "fr": "fra",
+    "德文": "de", "德语": "de", "de": "de",
+    "俄文": "ru", "俄语": "ru", "ru": "ru",
+    "西班牙语": "spa", "spa": "spa", "es": "spa",
+    "葡萄牙语": "pt", "pt": "pt",
+    "意大利语": "it", "it": "it",
+    "阿拉伯语": "ara", "ara": "ara", "ar": "ara",
+    "泰语": "th", "th": "th",
+    "越南语": "vie", "vie": "vie", "vi": "vie",
+}
+
+
+def _normalize_lang(raw: str, default: str) -> str:
+    """把配置/命令中的语言写法归一化为百度语言代码（支持中文别名）。"""
+    key = (raw or "").strip().lower()
+    if not key:
+        return default
+    return _LANG_ALIASES.get(key, key)
+
+
+def _looks_like_lang(text: str, lang: str) -> bool:
+    """粗判文本是否已是目标语言（仅用于跳过无谓的翻译调用）。
+
+    只对中文目标做判断：非空白字符里汉字占比 ≥ 60% 即认为已是中文。"""
+    if lang not in ("zh", "cht"):
+        return False
+    stripped = [c for c in text if not c.isspace()]
+    if not stripped:
+        return True
+    cjk = sum(1 for c in stripped if "\u4e00" <= c <= "\u9fff")
+    return cjk / len(stripped) >= 0.6
+
+
+def _protect_translate_tokens(text: str) -> tuple[str, dict]:
+    """把不该被翻译的片段换成 {n} 占位符，返回（保护后的文本, 占位符表）。"""
+    mapping: dict = {}
+
+    def _sub(match: "re.Match") -> str:
+        token = "{%d}" % len(mapping)
+        mapping[token] = match.group(0)
+        return token
+
+    return _TRANSLATE_KEEP_RE.sub(_sub, text), mapping
+
+
+def _restore_translate_tokens(text: str, mapping: dict) -> str | None:
+    """还原占位符；有占位符被翻译接口吞掉/改写时返回 None（调用方保留原文）。"""
+    if not mapping:
+        return text
+    seen: set = set()
+
+    def _sub(match: "re.Match") -> str:
+        # 接口可能把 {0} 写成 { 0 }，统一按数字还原
+        token = "{%s}" % match.group(1)
+        value = mapping.get(token)
+        if value is None:
+            return match.group(0)
+        seen.add(token)
+        return value
+
+    restored = _TRANSLATE_PLACEHOLDER_RE.sub(_sub, text)
+    if len(seen) != len(mapping):
+        return None
+    return restored
+
+
+def _split_translate_chunks(text: str, max_bytes: int = _BAIDU_Q_MAX_BYTES) -> list:
+    """按 UTF-8 字节数把长文本切成不超过上限的片段（优先在换行处切）。"""
+    chunks: list = []
+    buf = ""
+    for line in text.splitlines(keepends=True):
+        if len((buf + line).encode("utf-8")) <= max_bytes:
+            buf += line
+            continue
+        if buf:
+            chunks.append(buf)
+            buf = ""
+        if len(line.encode("utf-8")) <= max_bytes:
+            buf = line
+            continue
+        # 单行本身就超长：按字符累加切分
+        piece = ""
+        for ch in line:
+            if len((piece + ch).encode("utf-8")) > max_bytes:
+                chunks.append(piece)
+                piece = ch
+            else:
+                piece += ch
+        buf = piece
+    if buf:
+        chunks.append(buf)
+    if not chunks and text:
+        chunks.append(text)
+    return chunks
+
+
+async def _baidu_translate(
+    text: str,
+    appid: str,
+    secret: str,
+    from_lang: str,
+    to_lang: str,
+    timeout: float = 10.0,
+    interval: float = 1.1,
+    use_proxy: bool = False,
+    proxy_url: str | None = None,
+) -> str:
+    """调用百度翻译「通用文本翻译」返回译文（长文本自动分段拼接）。
+
+    签名规则 sign = md5(appid + q + salt + 密钥)；失败抛异常，由调用方降级为原文。
+    代理三态与媒体下载一致：关→直连；开且地址为空→系统代理；开且非空→该地址。
+    """
+    import aiohttp  # 惰性导入：与媒体下载保持一致，缺失时不影响其余功能
+
+    global _TRANSLATE_LAST_CALL
+    proxy = proxy_url if (use_proxy and proxy_url) else None
+    trust_env = bool(use_proxy and not proxy_url)
+    translated: list = []
+
+    async with _TRANSLATE_LOCK:
+        for chunk in _split_translate_chunks(text):
+            data = {}
+            for attempt in range(2):
+                wait = interval - (time.monotonic() - _TRANSLATE_LAST_CALL)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                salt = str(secrets.randbelow(65536) + 32768)
+                sign = hashlib.md5(f"{appid}{chunk}{salt}{secret}".encode("utf-8")).hexdigest()
+                payload = {
+                    "q": chunk, "from": from_lang, "to": to_lang,
+                    "appid": appid, "salt": salt, "sign": sign,
+                }
+                client_timeout = aiohttp.ClientTimeout(total=timeout)
+                async with aiohttp.ClientSession(timeout=client_timeout, trust_env=trust_env) as session:
+                    async with session.post(_BAIDU_TRANSLATE_URL, data=payload, proxy=proxy) as resp:
+                        _TRANSLATE_LAST_CALL = time.monotonic()
+                        data = await resp.json(content_type=None)
+                code = str(data.get("error_code", "") or "")
+                if not code:
+                    break
+                # 54003 = 访问频率受限：等一个间隔再重试一次
+                if code == "54003" and attempt == 0:
+                    await asyncio.sleep(max(interval, 1.0))
+                    continue
+                raise RuntimeError(f"百度翻译错误 {code}: {data.get('error_msg', '')}")
+            items = data.get("trans_result") or []
+            if not items:
+                raise RuntimeError("百度翻译返回结果为空")
+            translated.append("\n".join(str(item.get("dst", "")) for item in items))
+    return "\n".join(translated)
+
 
 # ------------------------
 # 存储层（无锁简化）
@@ -938,6 +1121,8 @@ class MsgForward(star.Star):
         self._discord_hook_ready_warned: bool = False
         self._discord_empty_skipped: int = 0
         self._discord_handled_ids: set = set()
+        # 翻译告警去重：按 key 只告警一次，避免接口报错时每条消息刷屏
+        self._translate_warned: set = set()
 
         # 迁移旧版 list 存储的 UMO 字段 → 每行一条的文本（修复 WebUI 校验失败）
         self._migrate_legacy_umo_lists()
@@ -1076,6 +1261,9 @@ class MsgForward(star.Star):
         return len(rules)
 
     async def initialize(self):
+        # 登记为当前活跃实例：补挂监听与转发都以此实例的配置为准
+        global _ACTIVE_INSTANCE
+        _ACTIVE_INSTANCE = self
         # 恢复上次未发送完的持久化队列（重启/重载不丢消息）
         self._restore_persisted_queue()
         self._queue_worker_task = asyncio.create_task(self._queue_worker())
@@ -1085,6 +1273,15 @@ class MsgForward(star.Star):
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
         # Discord 机器人消息接管
         self._discord_hook_task = asyncio.create_task(self._discord_hook_loop())
+        # 重复规则提示：同源同目标的两条规则会让「关掉一条仍在转发」看起来像失效
+        try:
+            for idxs, src, dst in self._duplicate_rule_groups():
+                logger.warning(
+                    f"[astrbot_plugin_msg_forward_cc] ⚠️ 检测到重复规则 {idxs}（源/目标完全相同）："
+                    f"{'、'.join(src)} → {'、'.join(dst)}，建议只保留一条，否则关掉其中一条仍会被另一条转发"
+                )
+        except Exception as e:
+            logger.warning(f"[astrbot_plugin_msg_forward_cc] ⚠️ 重复规则检查失败：{e}")
         logger.info("MsgForward plugin init OK")
 
     @filter.command_group("mf")
@@ -1131,6 +1328,15 @@ class MsgForward(star.Star):
             "│   ├── at cache <秒>: 群成员列表缓存有效期（0=每次重新拉取）\n"
             "│   ├── at <编号> on|off: 设置某条规则昵称反查（inherit=继承全局）\n"
             "│   └── at test <群号或UMO>: 测试目标群 @昵称反查命中情况\n"
+            "├── 🌐 翻译\n"
+            "│   ├── translate status: 查看翻译配置与各规则开关\n"
+            "│   ├── translate on / off: 全局开启/关闭转发时翻译\n"
+            "│   ├── translate to <语言>: 目标语言（zh/中文/en/jp…）\n"
+            "│   ├── translate from <语言>: 源语言（auto=自动检测）\n"
+            "│   ├── translate interval <毫秒>: 调用接口最小间隔（标准版 QPS=1 建议 1100）\n"
+            "│   ├── translate keep on|off: 译文后是否附原文\n"
+            "│   ├── translate <编号> on|off|inherit: 规则级翻译开关\n"
+            "│   └── translate test <文本>: 实测翻译（验证 APPID/密钥）\n"
             "├── ⏳ 发送队列\n"
             "│   ├── queue status: 查看发送队列状态与配置\n"
             "│   ├── queue on / queue off: 启用/停用发送队列总开关\n"
@@ -1152,7 +1358,9 @@ class MsgForward(star.Star):
             "冷却与队列同时开启时冷却失效（队列间隔已在限流），\n"
             "list 中以 ❄失效(队列中) 标记，日志会告警一次。\n"
             "@ 转发：默认 At 一律转为文本 @昵称（不发送真实 At，稳妥）；开启昵称反查\n"
-            "（高级 @）后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭）。"
+            "（高级 @）后按目标群成员列表把 @昵称 换成真实 qq 再精确 @（默认关闭）。\n"
+            "翻译：规则级开关，开启后转发前把文字译为目标语言（百度翻译开放平台）；\n"
+            "只翻文字，图片/语音/视频/文件与来源信息头原样转发，接口失败自动保留原文。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1303,6 +1511,7 @@ class MsgForward(star.Star):
             qmax = self._rule_queue_max_size(r)
             qmax_str = f"📮≤{qmax}条" if qmax > 0 else ""
             at_str = "🔔@反查" if self._should_at_lookup(r) else ""
+            tr_str = "🌐翻译" if self._should_translate(r) else ""
             # 内容类型覆盖标记：仅当规则显式配置 content_types 时显示
             # （只选 1 类时显示类型名如 📦仅表情，多类显示类数如 📦3类）
             ct_keys = self._rule_content_types_raw(r)
@@ -1311,7 +1520,7 @@ class MsgForward(star.Star):
                 ct_str = f"📦仅{CONTENT_TYPES[first]}" if len(ct_keys) == 1 else f"📦{len(ct_keys)}类"
             else:
                 ct_str = ""
-            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, qmax_str, at_str, ct_str]
+            parts = [en_status, f"#{idx}", self._rule_name(r), hide_status, cd_str, qi_str, qmax_str, at_str, ct_str, tr_str]
             lines.append(" ".join(p for p in parts if p))
         return lines
 
@@ -1697,6 +1906,172 @@ class MsgForward(star.Star):
         lines.append("提示：转发时会把 @昵称 中能在上表命中的昵称替换为对应 qq。")
         yield event.plain_result("\n".join(lines))
 
+    @mf.group("translate")
+    def translate(self):
+        """translate 命令组：转发时翻译（百度翻译开放平台）"""
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("status")
+    async def cmd_translate_status(self, event: AstrMessageEvent):
+        """查看翻译配置与各规则开关"""
+        settings = self._translate_settings()
+        cred = "✅ 已配置" if (settings["appid"] and settings["key"]) else "❌ 未配置（请在 WebUI 填 APPID 与密钥）"
+        lines = [
+            "🌐 转发时翻译（百度翻译·通用文本翻译）",
+            f"总开关：{'✅ 全局开启' if self._global_translate_enabled() else '⛔ 全局关闭（默认）'}",
+            f"APPID/密钥：{cred}",
+            f"语言：{settings['from']} → {settings['to']}"
+            + ("（自动检测源语言）" if settings["from"] == "auto" else ""),
+            f"调用间隔：{int(settings['interval'] * 1000)}ms | 超时：{settings['timeout']:.0f}s"
+            + (" | 走代理" if settings["use_proxy"] else ""),
+            f"已是目标语言则跳过：{'是' if settings['skip_same_lang'] else '否'}"
+            f" | 附原文：{'是' if settings['keep_original'] else '否'}",
+            "范围：只翻译文字组件，图片/语音/视频/文件等媒体与来源信息头原样转发",
+        ]
+        rules = self.config.get("rules", [])
+        per_rule = [(idx, r) for idx, r in enumerate(rules, start=1) if r.get("translate") is not None]
+        if per_rule:
+            lines.append("\n规则级翻译：")
+            for idx, r in per_rule:
+                lines.append(f"  #{idx} | {self._rule_name(r)} | {'🌐开启' if self._should_translate(r) else '关闭'}")
+        else:
+            lines.append("（所有规则继承全局翻译设置）")
+        lines.append(
+            "\n用法：/mf translate on|off 全局开关；/mf translate to <语言> 目标语言；"
+            "/mf translate from <语言> 源语言；/mf translate interval <毫秒> 调用间隔；"
+            "/mf translate keep on|off 是否附原文；/mf translate <编号> on|off|inherit 规则级；"
+            "/mf translate test <文本> 实测翻译"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("on")
+    async def cmd_translate_on(self, event: AstrMessageEvent):
+        """全局开启转发时翻译"""
+        self.config["translate_enabled"] = True
+        self.config.save_config()
+        missing = "" if (self.config.get("translate_appid") and self.config.get("translate_key")) else \
+            "\n⚠️ 还没填百度翻译 APPID / 密钥（WebUI 插件配置里填），填好才会真正翻译"
+        yield event.plain_result(f"✅ 已全局开启转发时翻译（规则未单独设置时生效）{missing}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("off")
+    async def cmd_translate_off(self, event: AstrMessageEvent):
+        """全局关闭转发时翻译"""
+        self.config["translate_enabled"] = False
+        self.config.save_config()
+        yield event.plain_result("✅ 已全局关闭转发时翻译")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("to")
+    async def cmd_translate_to(self, event: AstrMessageEvent, lang: str = ""):
+        """设置目标语言（如 zh / 中文 / en）"""
+        raw = (lang or "").strip()
+        if not raw:
+            yield event.plain_result("❌ 用法：/mf translate to <语言>（如 zh / 中文 / en / jp，具体代码见百度文档）")
+            return
+        code = _normalize_lang(raw, "zh")
+        if code == "auto":
+            yield event.plain_result("❌ 目标语言不能是 auto（自动检测只能用于源语言）")
+            return
+        self.config["translate_to_lang"] = code
+        self.config.save_config()
+        yield event.plain_result(f"✅ 翻译目标语言已设为 {code}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("from")
+    async def cmd_translate_from(self, event: AstrMessageEvent, lang: str = ""):
+        """设置源语言（auto=自动检测）"""
+        raw = (lang or "").strip()
+        if not raw:
+            yield event.plain_result("❌ 用法：/mf translate from <语言>（auto=自动检测，默认）")
+            return
+        code = _normalize_lang(raw, "auto")
+        self.config["translate_from_lang"] = code
+        self.config.save_config()
+        yield event.plain_result(f"✅ 翻译源语言已设为 {code}" + ("（自动检测）" if code == "auto" else ""))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("interval")
+    async def cmd_translate_interval(self, event: AstrMessageEvent, ms: str = ""):
+        """设置两次调用接口的最小间隔（毫秒）"""
+        arg = (ms or "").strip()
+        try:
+            val = int(arg)
+            if val < 0:
+                raise ValueError
+        except ValueError:
+            yield event.plain_result(
+                "❌ 用法：/mf translate interval <毫秒>（非负整数）\n"
+                "  百度标准版 QPS=1 → 建议 1100；高级版可调小（如 150）"
+            )
+            return
+        self.config["translate_interval_ms"] = val
+        self.config.save_config()
+        yield event.plain_result(f"✅ 翻译调用间隔已设为 {val}ms")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("keep")
+    async def cmd_translate_keep(self, event: AstrMessageEvent, mode: str = ""):
+        """设置译文后是否附上原文"""
+        arg = (mode or "").strip().lower()
+        if arg not in ("on", "off", "true", "false"):
+            yield event.plain_result("❌ 用法：/mf translate keep on|off（on=译文后附原文）")
+            return
+        val = arg in ("on", "true")
+        self.config["translate_keep_original"] = val
+        self.config.save_config()
+        yield event.plain_result(f"✅ 转发时{'会' if val else '不会'}附带原文")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("set")
+    async def cmd_translate_set(self, event: AstrMessageEvent, rid: str = "", mode: str = ""):
+        """设置规则级翻译（/mf translate <编号> on|off|inherit）"""
+        arg = (mode or "").strip().lower()
+        if not rid or arg not in ("on", "off", "inherit", "true", "false"):
+            yield event.plain_result(
+                "❌ 用法：/mf translate <编号> on|off|inherit\n"
+                "  on=该规则转发时翻译；off=不翻译；inherit=继承全局设置"
+            )
+            return
+        rules, idx, rule = self._get_rule(rid)
+        if rule is None:
+            yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+            return
+        if arg == "inherit":
+            rule.pop("translate", None)
+            result = "已重置为继承全局"
+        else:
+            rule["translate"] = "true" if arg in ("on", "true") else "false"
+            result = f"已设为{'🌐开启' if rule['translate'] == 'true' else '关闭'}"
+        self.config["rules"] = rules
+        self.config.save_config()
+        yield event.plain_result(f"✅ 规则 #{rid}（{self._rule_name(rule)}）翻译{result}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @translate.command("test")
+    async def cmd_translate_test(self, event: AstrMessageEvent, text: str = ""):
+        """实测翻译一段文字（用于验证 APPID/密钥是否可用）"""
+        raw = (text or "").strip()
+        if not raw:
+            yield event.plain_result("❌ 用法：/mf translate test <文本>\n例：/mf translate test Hello world")
+            return
+        settings = self._translate_settings()
+        if not settings["appid"] or not settings["key"]:
+            yield event.plain_result("❌ 未配置百度翻译 APPID / 密钥，请先在 WebUI 插件配置里填写")
+            return
+        try:
+            result = await self._translate_text(raw, settings)
+        except Exception as e:
+            yield event.plain_result(
+                f"❌ 翻译失败：{e}\n"
+                "  常见原因：APPID/密钥错误（54001）、未开通通用文本翻译（54003/54004）、"
+                "IP 未在白名单（58000）、调用频率超限（54003）"
+            )
+            return
+        yield event.plain_result(f"✅ 翻译成功（{settings['from']} → {settings['to']}）\n原文：{raw}\n译文：{result}")
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mf.command("listall")
     async def cmd_list_all(self, event: AstrMessageEvent):
@@ -1708,6 +2083,7 @@ class MsgForward(star.Star):
 
         lines = ["📜 所有转发规则："]
         lines.extend(self._format_rules(list(enumerate(rules, start=1))))
+        lines.extend(self._duplicate_rule_hints())
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2832,6 +3208,130 @@ class MsgForward(star.Star):
             except Exception:
                 pass
 
+    # ----- 重复规则检测（同源同目标的规则会让「关掉一条仍在转发」看起来像失效） -----
+
+    def _duplicate_rule_groups(self) -> list:
+        """按「源集合 + 目标集合」分组，返回存在多条规则的分组：[(编号列表, 源, 目标), ...]。"""
+        groups: dict = {}
+        for idx, rule in enumerate(self.config.get("rules", []), start=1):
+            if not isinstance(rule, dict):
+                continue
+            src = tuple(sorted(MsgForward._umo_list(rule, "source_umo")))
+            dst = tuple(sorted(MsgForward._umo_list(rule, "target_umo")))
+            if not src or not dst:
+                continue
+            groups.setdefault((src, dst), []).append(idx)
+        return [(idxs, key[0], key[1]) for key, idxs in groups.items() if len(idxs) > 1]
+
+    def _duplicate_rule_hints(self) -> list:
+        """把重复规则整理成展示行（供 /mf listall 提示）。"""
+        lines = []
+        for idxs, src, dst in self._duplicate_rule_groups():
+            lines.append(
+                f"⚠️ 规则 {'、'.join('#' + str(i) for i in idxs)} 的源/目标完全相同（{'、'.join(src)} → {'、'.join(dst)}），"
+                f"转发会重复，建议 /mf del 删掉多余的那些"
+            )
+        return lines
+
+    # ----- 转发时翻译（百度翻译开放平台，仅翻文字） -----
+    def _global_translate_enabled(self) -> bool:
+        """全局翻译开关（规则未单独设置时生效）。"""
+        return bool(self.config.get("translate_enabled", False))
+
+    def _should_translate(self, rule: dict) -> bool:
+        """判断某条规则转发时是否翻译：规则显式 true/false 优先，inherit（或未设置）继承全局。
+
+        兼容旧版 bool 存储（True/False）。"""
+        val = rule.get("translate")
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in ("true", "on"):
+                return True
+            if v in ("false", "off"):
+                return False
+        return self._global_translate_enabled()
+
+    def _translate_settings(self) -> dict:
+        """读取翻译相关全局配置（防御式转换，非法值降级为默认）。"""
+        def _int(key: str, default: int, minimum: int = 0) -> int:
+            try:
+                val = int(self.config.get(key, default) or 0)
+            except (TypeError, ValueError):
+                return default
+            return max(val, minimum)
+
+        return {
+            "appid": str(self.config.get("translate_appid", "") or "").strip(),
+            "key": str(self.config.get("translate_key", "") or "").strip(),
+            "from": _normalize_lang(str(self.config.get("translate_from_lang", "auto") or ""), "auto"),
+            "to": _normalize_lang(str(self.config.get("translate_to_lang", "zh") or ""), "zh"),
+            "interval": _int("translate_interval_ms", 1100, 0) / 1000.0,
+            "timeout": float(_int("translate_timeout", 10, 1)),
+            "keep_original": bool(self.config.get("translate_keep_original", False)),
+            "skip_same_lang": bool(self.config.get("translate_skip_same_lang", True)),
+            "use_proxy": bool(self.config.get("translate_use_proxy", False)),
+            "proxy_url": str(self.config.get("translate_proxy_url", "") or "").strip(),
+        }
+
+    def _warn_translate_once(self, key: str, message: str) -> None:
+        """翻译相关告警按 key 只打一次，避免每条消息刷屏。"""
+        if key in self._translate_warned:
+            return
+        self._translate_warned.add(key)
+        logger.warning(f"[astrbot_plugin_msg_forward_cc] ⚠️ {message}")
+
+    async def _translate_text(self, text: str, settings: dict) -> str:
+        """翻译一段文字：保护链接/标记 → 调接口 → 还原占位符；异常由调用方降级为原文。"""
+        if settings["skip_same_lang"] and _looks_like_lang(text, settings["to"]):
+            return text
+        protected, mapping = _protect_translate_tokens(text)
+        result = await _baidu_translate(
+            protected,
+            settings["appid"], settings["key"], settings["from"], settings["to"],
+            timeout=settings["timeout"], interval=settings["interval"],
+            use_proxy=settings["use_proxy"], proxy_url=settings["proxy_url"] or None,
+        )
+        restored = _restore_translate_tokens(result, mapping)
+        if restored is None:
+            self._warn_translate_once("placeholder", "翻译结果改动了链接/标记占位符，本条保留原文")
+            return text
+        restored = restored.strip()
+        if not restored or restored == text:
+            return text
+        if settings["keep_original"]:
+            return f"{restored}\n\n—— 原文 ——\n{text}"
+        return restored
+
+    async def _translate_chain(self, chain: list) -> list:
+        """翻译消息链中的文字组件，图片/语音/视频/文件等媒体原样保留。
+
+        未配置 APPID/密钥、接口报错、占位符被破坏时都保留原文继续转发，绝不影响转发本身。"""
+        if not any(isinstance(c, Plain) and (c.text or "").strip() for c in chain):
+            return chain
+        settings = self._translate_settings()
+        if not settings["appid"] or not settings["key"]:
+            self._warn_translate_once(
+                "cred", "已开启翻译但未配置百度翻译 APPID/密钥（translate_appid / translate_key），本次不翻译"
+            )
+            return chain
+        texts = [c.text for c in chain if isinstance(c, Plain) and (c.text or "").strip()]
+        translated: dict = {}
+        for text in dict.fromkeys(texts):  # 同一条消息内的重复文本只调一次接口
+            try:
+                translated[text] = await self._translate_text(text, settings)
+            except Exception as e:
+                self._warn_translate_once(f"fail:{type(e).__name__}", f"翻译失败，本条保留原文继续转发：{e}")
+                translated[text] = text
+        out = []
+        for comp in chain:
+            if isinstance(comp, Plain) and comp.text in translated:
+                out.append(Plain(text=translated[comp.text]))
+            else:
+                out.append(comp)
+        return out
+
     # ----- 平台机器人消息接管（仅 Discord） -----
 
     @staticmethod
@@ -2874,7 +3374,12 @@ class MsgForward(star.Star):
         return None
 
     def _hook_discord_clients(self) -> None:
-        """为所有已就绪的 Discord 客户端补挂机器人消息监听（幂等）。"""
+        """为所有已就绪的 Discord 客户端补挂机器人消息监听（幂等）。
+
+        只有当前活跃实例才挂载：插件重载后旧实例的任务可能尚未结束，若不拦住，
+        新旧实例会来回抢挂监听，旧实例还会按旧配置继续转发。"""
+        if _ACTIVE_INSTANCE is not None and _ACTIVE_INSTANCE is not self:
+            return
         try:
             from astrbot.core.platform.sources.discord.discord_platform_event import (
                 DiscordPlatformEvent,
@@ -2900,6 +3405,9 @@ class MsgForward(star.Star):
             if hook is not None:
                 if hook[0] is self:
                     hooked += 1
+                    continue
+                # 活跃实例持有的监听不要抢（否则新旧实例来回抢挂）
+                if hook[0] is _ACTIVE_INSTANCE:
                     continue
                 try:
                     client.remove_listener(hook[1])
@@ -2970,6 +3478,9 @@ class MsgForward(star.Star):
 
         async def _on_discord_bot_message(message: "discord.Message") -> None:
             try:
+                # 始终用当前活跃实例转发：WebUI 保存配置会重载插件，旧实例带着旧配置，
+                # 若还挂在客户端上就会「关掉规则仍照转」；活跃实例未登记时退回自身
+                plugin = _ACTIVE_INSTANCE or self
                 author = getattr(message, "author", None)
                 if author is None or not getattr(author, "bot", False):
                     return
@@ -2986,8 +3497,8 @@ class MsgForward(star.Star):
                     abm = await abm
                 if not abm.message:
                     # 无正文也无附件（系统提示、纯 Embed 卡片等）跳过；前几条记日志便于排查
-                    if self._discord_empty_skipped < 5:
-                        self._discord_empty_skipped += 1
+                    if plugin._discord_empty_skipped < 5:
+                        plugin._discord_empty_skipped += 1
                         logger.info(
                             "[astrbot_plugin_msg_forward_cc] ℹ️ 跳过一条无正文/附件的 Discord 机器人消息"
                             f"（频道 {getattr(abm, 'session_id', '')}，Discord 卡片 Embed 暂不转换）"
@@ -2997,7 +3508,7 @@ class MsgForward(star.Star):
                     abm.self_id = str(bot_user.id)
                 # 核心管道若已投递并转发过这条（说明该版本不过滤机器人消息），这次就不再转发
                 message_id = str(getattr(abm, "message_id", "") or "")
-                if message_id and message_id in self._discord_handled_ids:
+                if message_id and message_id in plugin._discord_handled_ids:
                     return
                 event = event_cls(
                     message_str=abm.message_str,
@@ -3008,7 +3519,7 @@ class MsgForward(star.Star):
                 )
                 # 标记来源通道：forward_message 会登记消息 ID 去重，但不该拦掉这次自己的转发
                 setattr(event, _DISCORD_HOOK_EVENT_ATTR, True)
-                await self.forward_message(event)
+                await plugin.forward_message(event)
             except Exception as e:
                 logger.error(f"[astrbot_plugin_msg_forward_cc] ❌ Discord 机器人消息转发异常：{e}")
 
@@ -3069,6 +3580,10 @@ class MsgForward(star.Star):
                 if not filtered_chain:
                     # 消息不含任何选中类型，跳过该规则（不转发、不占冷却）
                     continue
+
+                # 转发时翻译（规则级开关）：只翻文字组件，媒体与来源信息头都不动
+                if self._should_translate(rule):
+                    filtered_chain = await self._translate_chain(filtered_chain)
 
                 # 冷却检查
                 cooldown_sec = self._cooldown_for(rule)
@@ -3186,6 +3701,10 @@ class MsgForward(star.Star):
             logger.error(f"❌ 转发逻辑异常: {e}")
 
     async def terminate(self):
+        # 注销活跃实例（仅当自己就是活跃实例时），避免重载后新实例被误清
+        global _ACTIVE_INSTANCE
+        if _ACTIVE_INSTANCE is self:
+            _ACTIVE_INSTANCE = None
         if self._queue_worker_task is not None:
             self._queue_worker_task.cancel()
         if self._cleanup_task is not None:

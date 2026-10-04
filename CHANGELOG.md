@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### 修复
+
+- **关掉规则后机器人/Webhook 公告仍被转发**：补挂的 Discord 监听原本绑定在「创建它的插件实例」上，而 WebUI 保存配置会触发插件重载（旧实例 terminate + 新实例 initialize），重载期间旧实例带着**旧配置**仍挂在 Discord 客户端上，于是「关了规则照样转」。现改为监听一律通过**当前活跃实例**转发（`_ACTIVE_INSTANCE`，`initialize()` 登记、`terminate()` 注销），旧实例不仅不再被用来转发，也不会再把监听抢回去（挂载前先判断监听归属）
+- **重复规则难以发现**：同源同目标的两条规则会导致转发重复（此前已按内容去重，但「关掉其中一条仍在转发」看起来就像规则失效）。现启动时检测同源同目标的重复规则并向日志告警，`/mf listall` 末尾也会列出「规则 #a、#b 源/目标完全相同，建议 /mf del 删掉多余的」
+
+### 新增
+
+- **转发时翻译（百度翻译开放平台·通用文本翻译）**：新增规则级开关「转发时翻译（`translate`，inherit/true/false 三态）」——典型用法是在「Discord → QQ」那条规则上开启，其他规则不受影响；**只翻译文字组件**，图片/语音/视频/文件等媒体与来源信息头原样转发
+- **翻译配置项**：`translate_enabled`（全局默认开关）、`translate_appid` / `translate_key`（百度控制台的 APPID 与密钥）、`translate_to_lang`（目标语言，支持 `zh`/`中文`/`en`/`jp` 等别名）、`translate_from_lang`（源语言，默认 `auto` 自动检测）、`translate_skip_same_lang`（已是目标语言则跳过，省调用次数）、`translate_keep_original`（译文后附原文）、`translate_interval_ms`（调用间隔，标准版 QPS=1 默认 1100ms 并自动串行化）、`translate_timeout`、`translate_use_proxy` / `translate_proxy_url`
+- **`/mf translate` 命令组**：`status` 查看配置、`on`/`off` 全局开关、`to`/`from` 设置语言、`interval` 设置调用间隔、`keep` 是否附原文、`<编号> on|off|inherit` 规则级开关、`test <文本>` 实测翻译（用来验证 APPID/密钥）
+- **翻译的健壮性处理**：链接、Discord 标记（`<:表情:id>` / `<@id>` / `<#频道>`）与行内代码先换成占位符、译完再还原，被接口吞掉/改写时本条保留原文；长文本按 UTF-8 字节分段请求后拼接；命中 54003（频率受限）自动等待重试一次；未配置密钥或接口报错时保留原文继续转发，告警按类型只打一次；`/mf list` / `/mf listall` 为开启翻译的规则增加 `🌐翻译` 标记
+
 ## v0.5.7 (2026-10-03)
 
 ### 修复

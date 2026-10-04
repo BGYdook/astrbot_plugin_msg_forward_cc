@@ -42,6 +42,7 @@
 工具与数据路径（常量、MIME 映射）
 → 媒体工具函数（下载 / 重建 / 本地化 / 序列化）
 → 消息链清洗（@ 清洗、File 清洗、At 转发策略）
+→ 转发时翻译（百度翻译：签名 / 分段 / 占位符保护 / 语言别名 / 节流）
 → 平台机器人消息接管（目前仅 Discord：挂载标记常量、轮询间隔、消息 ID 去重上限）
 → 存储层 MsgForwardStore（无锁简化）
 → 插件主体 MsgForward（__init__ / 命令 / Discord 客户端监听挂载 / 转发主逻辑）
@@ -75,6 +76,10 @@
 - `_parse_platform_set(raw)` / `_at_passthrough_platforms(config)`：平台集合解析（内置 QQ 系白名单 + 配置 `at_passthrough_extra_platforms` 追加）
 - `load_json(path)` / `save_json(path, data)`：健壮文件读写，分类记录错误（FileNotFoundError/JSONDecodeError/OSError/TypeError）；原子写入（先写 `.tmp` 再 replace，`ensure_ascii=False, indent=2`）
 - `gen_code(n=6)`：`secrets` 生成绑定码（小写字母+数字）
+- `_normalize_lang(raw, default)` / `_looks_like_lang(text, lang)`：语言别名 → 百度语言代码；粗判文本是否已是中文（汉字占比 ≥60%，用于跳过无谓调用）
+- `_protect_translate_tokens(text)` / `_restore_translate_tokens(text, mapping)`：把链接、Discord 标记（`<:表情:id>` / `<@id>` / `<#频道>`）与行内代码换成 `{n}` 占位符再翻译；还原时若有占位符被接口吞掉/改写则返回 None（调用方保留原文）
+- `_split_translate_chunks(text, max_bytes)`：按 UTF-8 字节数切分长文本（优先换行处切，单行超长按字符切）
+- `_baidu_translate(text, appid, secret, from_lang, to_lang, timeout, interval, use_proxy, proxy_url)`：百度翻译「通用文本翻译」，sign = md5(appid+q+salt+密钥)；模块级 `asyncio.Lock` + 最小间隔串行节流（标准版 QPS=1），54003 频率受限自动等一个间隔重试一次，多段结果按行拼接；失败抛异常由调用方降级
 
 ### 2.4 存储层 `MsgForwardStore`
 
@@ -184,6 +189,15 @@
 | 按昵称反查 @ 对象（默认关闭） | `at_nickname_lookup` | bool, false | 拉取目标群成员列表反查真实成员后精确 @，QQ 系有效 |
 | @ 昵称反查的群成员缓存时长（秒） | `at_nickname_lookup_cache_ttl` | int, 300 | 0=每次重新拉取 |
 | 额外允许 @ 透传的目标平台 | `at_passthrough_extra_platforms` | list | 默认已含 QQ 系（aiocqhttp/qq_official 等），自建 QQ 适配器在此追加 |
+| 转发时翻译 | `translate_enabled` | bool, false | 全局默认开关；只翻文字组件，媒体与来源信息头不翻 |
+| 百度翻译 APPID / 密钥 | `translate_appid` / `translate_key` | string, "" | 百度翻译开放平台「通用文本翻译」，两者都填才会真正翻译 |
+| 翻译目标语言 | `translate_to_lang` | string, zh | 支持中文别名：`zh`/`中文`、`cht`/`繁体`、`en`/`英语`、`jp`/`日语`… |
+| 翻译源语言 | `translate_from_lang` | string, auto | `auto`=自动检测 |
+| 已是目标语言则跳过 | `translate_skip_same_lang` | bool, true | 汉字占比 ≥60% 且目标为中文时跳过，省调用次数 |
+| 译文后附原文 | `translate_keep_original` | bool, false | 输出「译文 + —— 原文 —— + 原文」 |
+| 翻译调用间隔（毫秒） | `translate_interval_ms` | int, 1100 | 标准版 QPS=1 保持 1100；高级版可调小 |
+| 翻译接口超时（秒） | `translate_timeout` | int, 10 | 超时/报错保留原文继续转发 |
+| 翻译请求走代理 / 代理地址 | `translate_use_proxy` / `translate_proxy_url` | bool, false / string, "" | 代理三态同媒体下载 |
 | 平台名称映射 | `platform_names` | list | 每项 `原始平台名=显示名`（如 `aiocqhttp=QQ`），兼容旧版 `platform_name_map` object 格式自动迁移 |
 
 **规则模板 `rule`（`rules` 为 template_list，模板键 `__template_key: "rule"`）：**
@@ -205,6 +219,7 @@
 | 按昵称反查 @ 对象 | `at_nickname_lookup` | string, inherit | inherit / true / false 三态 |
 | 媒体下载是否走代理 | `use_proxy` | bool, false | |
 | 媒体下载代理地址 | `proxy_url` | string, "" | 仅 `use_proxy` 开启时生效 |
+| 转发时翻译 | `translate` | string, inherit | inherit / true / false 三态；典型用法：Discord → QQ 的规则设为 true |
 
 ### 5.2 数据文件（data_dir = `StarTools.get_data_dir("msg_forward_cc")`）
 
@@ -217,7 +232,7 @@
 ### 5.3 配置读取模式
 
 - 统一 `self.config.get(key, default)` 读取，防御式转换（`int(...)` 包 `(TypeError, ValueError)`）
-- 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`
+- 规则级字段解析统一走专有方法：`_cooldown_for(rule)`（未设置=继承全局、显式 0=关闭）、`_queue_interval_for(rule)`、`_rule_queue_max_size(rule)`、`_should_download_media(rule)`、`_should_at_lookup(rule)`、`_at_lookup_ttl()`、`_should_translate(rule)`（三态 inherit 继承全局 `translate_enabled`）、`_translate_settings()`（APPID/密钥/语言/间隔/超时/代理，防御式转换）
 
 ---
 
@@ -254,7 +269,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf bindraw [源平台] 源ID [目标平台] 目标ID` | 管理员 | 直接建规则（见 6.3） |
 | `mf del <编号>` | 管理员 | 删除规则（1-based 索引，与 `/mf list` 显示一致） |
 | `mf list` | 管理员 | 列出当前会话（source_umo 匹配）的规则；标记：🟢/⛔ 启停、🔒/🔓 隐藏、❄冷却、⏳队列间隔、📮队列上限、🔔@反查、📦内容类型 |
-| `mf listall` | 管理员 | 列出所有规则（同上标记） |
+| `mf listall` | 管理员 | 列出所有规则（同上标记，末尾附重复规则提示） |
 | `mf hide <编号>` | 管理员 | 切换单条规则 hide_header |
 | `mf toggle <编号>` | 管理员 | 启用/停用一条规则（enabled 字段） |
 | `mf remark <编号> [备注]` | 管理员 | 设置规则备注（留空清除，恢复默认显示） |
@@ -272,6 +287,13 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 | `mf at cache <秒>` | 管理员 | 设置群成员列表缓存时长（0=每次重新拉取） |
 | `mf at <编号> on\|off\|inherit` | 管理员 | 规则级昵称反查开关 |
 | `mf at test <群号\|UMO>` | 管理员 | 实测目标群 @昵称反查命中情况 |
+| `mf translate status` | 管理员 | 查看翻译配置（全局开关/APPID 是否已填/语言/间隔/超时）与各规则开关 |
+| `mf translate on` / `off` | 管理员 | 全局开启/关闭转发时翻译 |
+| `mf translate to <语言>` / `from <语言>` | 管理员 | 设置目标语言 / 源语言（`auto`=自动检测，支持中文别名） |
+| `mf translate interval <毫秒>` | 管理员 | 两次调用百度接口的最小间隔（标准版 QPS=1 建议 1100） |
+| `mf translate keep on\|off` | 管理员 | 译文后是否附上原文 |
+| `mf translate <编号> on\|off\|inherit` | 管理员 | 规则级翻译开关（典型：Discord → QQ 的规则开） |
+| `mf translate test <文本>` | 管理员 | 实测翻译，验证 APPID/密钥是否可用 |
 | `mf queue status` | 管理员 | 查看发送队列状态：总开关/消费状态(暂停/运行)/默认间隔/总上限/媒体保留/当前积压 + 各规则队列（间隔/长度上限/当前积压）表格 |
 | `mf queue on` / `off` | 管理员 | 发送队列总开关 |
 | `mf queue interval <秒>` | 管理员 | 设置全局默认队列间隔（0=关闭） |
@@ -312,12 +334,13 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 逐规则流程：
 1. 跳过 `enabled=false` 规则；`_should_forward(event, rule)` 过滤检查（规则级优先，inherit 继承全局）
 2. 内容类型筛选 `_content_types_for` + `_filter_chain_by_types`；过滤后为空则跳过（不转发、不占冷却）
-3. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
-4. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
-5. 主链：默认透传 `sanitized_chain`（媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
-6. 逐目标：At 策略（反查开启且选中 @ 类型 → `_sanitize_at_chain_for_target` + `_resolve_at_mentions` 精确 @；默认 → `_textify_at_chain` 转文本）；`_should_attach_header` 判定后前置来源头（末尾 `\n\n\u200b` 零宽空格避免连续换行问题）
-7. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳；单目标失败不影响其他目标
-8. 失败两层自动降级：第一层 AstrBot 核心重新本地化所有媒体重试；仍失败且含媒体时第二层 `_prepare_chain_fallback`（远程 URL 本地化，走规则级代理三态）重试；仍失败记录错误
+3. 转发时翻译：`_should_translate(rule)` 为真时 `_translate_chain` **只替换 Plain 文字组件**（媒体与来源头不翻）；链接/Discord 标记先用占位符保护，未配置密钥、接口报错、占位符被破坏时一律保留原文继续转发，告警按类型只打一次
+4. 队列分支：`queue_interval > 0` 且 `queue_enabled` 时消息不直接发送而是入队 `_enqueue_send`（**先于冷却检查**），由后台 worker 按间隔依次发送；入队前两级上限检查——先全局 `queue_max_size`（总上限），再规则级 `queue_max_size`，任一达到即丢弃并记录 error 日志
+5. 冷却检查 `_cooldown_for(rule)`：规则显式值优先（0=关闭本规则冷却），未设置时继承 `default_cooldown_seconds`；冷却期间跳过（冷却表纯内存，key = `source_umo|target_umo`）
+6. 主链：默认透传 `sanitized_chain`（媒体交给目标端自行下载）；`download_media_before_send` 开启时先 `_prepare_chain_for_forward` 本地化
+7. 逐目标：At 策略（反查开启且选中 @ 类型 → `_sanitize_at_chain_for_target` + `_resolve_at_mentions` 精确 @；默认 → `_textify_at_chain` 转文本）；`_should_attach_header` 判定后前置来源头（末尾 `\n\n\u200b` 零宽空格避免连续换行问题）；同一事件同目标同内容只发一次（重复规则拦截，见附录）
+8. `self.context.send_message(target, event.chain_result(new_chain))` 发送，成功后写入冷却时间戳；单目标失败不影响其他目标
+9. 失败两层自动降级：第一层 AstrBot 核心重新本地化所有媒体重试；仍失败且含媒体时第二层 `_prepare_chain_fallback`（远程 URL 本地化，走规则级代理三态）重试；仍失败记录错误
 
 **队列模式下的冷却（有意设计，非 bug）**：队列分支先于冷却检查 `continue`，冷却判断与写入只在即时发送路径执行、后台 worker 不读 `_cooldowns`，因此规则同时配置冷却与队列间隔时冷却**实际失效**，只有队列间隔在限流；`_cooldown_ignored(rule)` 判定（`queue_enabled` 开启且规则队列间隔 > 0），`_format_rules` / `cmd_filter_list` 显示 `❄失效(队列中)` / `❄Ns（队列中失效）` 标记，`forward_message` 按 `_cooldown_warned`（rule_key 去重）只告警一次。
 
@@ -456,4 +479,7 @@ async def cmd_queue_status(self, event: AstrMessageEvent):
 - 媒体缓存清理：启动时全清 + 每小时按保留时长清理；`queue clear` 立即清空（积压 + 媒体 + 持久化）
 - 自定义下载器把媒体写入媒体缓存目录（`media/` 或系统临时目录兜底），与 AstrBot 自身临时文件行为一致
 - 平台机器人消息接管：各平台适配器默认都会下发机器人消息，插件照常转发、无需额外处理，**只有 Discord 是例外**（`client.py` 的 `on_message` 直接丢弃 `author.bot` 消息，Webhook 同属 bot），这类消息不进事件管道。为保持「源会话的消息都转发」在各平台一致，插件**默认**（无配置项）用 `client.add_listener(func, "on_message")` 给 Discord 客户端补挂监听（py-cord 的 `dispatch` 会同时调用适配器覆写的 `on_message` 与附加监听），构造 `DiscordPlatformEvent` 后**直接调用 `forward_message`**，不经过核心管道——因此不会顺带唤醒 LLM 或其他插件；想排除机器人消息用规则自带过滤/内容类型筛选即可。挂载标记 `_DISCORD_HOOK_ATTR`（`(实例, 监听函数)` 元组）写在客户端实例上，用于幂等挂载与重载摘除；客户端优先按 `client` 属性取、取不到再按能力探测（`add_listener` + `user`），平台未就绪/重连时由 15 秒轮询补齐，发现适配器却始终挂不上时约 1 分钟后告警一次（不静默失效）。**去重有两条硬约束**：① Discord 消息存在「核心管道 + 补挂监听」两条投递通道，`forward_message` 里按消息 ID「先到先登记、后到跳过」，监听侧的事件带 `_DISCORD_HOOK_EVENT_ATTR` 标记以免被自己登记的 ID 拦掉，且**检查与登记之间不得有 await**（否则并发投递会同时通过检查）；② 同一事件内按「目标 + 内容签名」去重，拦截重复规则导致的同内容重复发送（v0.5.5 曾因先登记后转发把监听自己拦掉，v0.5.6 修正单通道误拦，v0.5.7 补齐跨通道对称去重与同事件内容去重）
+- 补挂监听与插件重载：WebUI 保存配置会 `save_config` + `plugin_manager.reload(插件名)`（terminate 旧实例 → initialize 新实例）。监听挂在 Discord 客户端上、不随实例销毁，因此模块级维护 `_ACTIVE_INSTANCE`（`initialize()` 登记、`terminate()` 仅注销自己），监听**一律通过活跃实例转发**、旧实例不再抢挂监听——否则旧实例会拿旧配置继续转发，表现为「WebUI 关掉规则仍在转」
+- 重复规则：同源同目标的两条规则会造成重复转发，也容易误判成「规则失效」（关掉一条另一条照转）。`_duplicate_rule_groups()` 按（源集合, 目标集合）分组检测，`initialize()` 启动告警一次，`/mf listall` 末尾用 `_duplicate_rule_hints()` 列出编号提示 `/mf del`
+- 转发时翻译（百度翻译开放平台）：规则级三态 `translate` 决定是否翻译，全局提供 APPID/密钥/语言/间隔/超时/代理；**只翻 Plain 文字组件**，媒体与来源信息头原样转发。硬约束：① 翻译前把链接、Discord 标记（`<:表情:id>` / `<@id>` / `<#频道>`）与行内代码换成 `{n}` 占位符，译后还原，**只要有占位符被接口吞掉或改写就整条保留原文**（宁可没翻，不能发出损坏内容）；② 百度标准版 QPS=1，模块级锁 + `translate_interval_ms` 串行节流，54003 自动等一个间隔重试一次，避免批量消息打满配额；③ 未配置密钥、接口报错、超时一律保留原文继续转发（转发本身不受影响），告警按类型只打一次不刷屏；④ `translate_skip_same_lang` 开启时汉字占比 ≥60% 且目标为中文的文本直接跳过，省调用次数
 - group 嵌套：`@mf.group("queue")` 注册子命令组（AstrBot filter API 支持），queue 命令均为 `@queue.command(...)`
